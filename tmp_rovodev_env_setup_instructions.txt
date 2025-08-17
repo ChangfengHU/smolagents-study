@@ -1,0 +1,32 @@
+# 环境变量与运行说明（PyCharm）
+
+1) 在 PyCharm 里设置环境变量（推荐）
+   - Run/Debug Configurations -> 选择脚本 examples/run_agent_pycharm.py
+   - Environment variables 添加：
+     - OPENAI_API_KEY=<你的OpenAI密钥>
+     - （可选）OPENAI_API_BASE=https://api.openai.com/v1
+     - （可选）OPENAI_MODEL_ID=gpt-4o-mini
+
+2) 或者使用 .env 文件（需安装 python-dotenv，仓库已依赖）
+   - 在项目根目录新建 .env，写入：
+       OPENAI_API_KEY=sk-xxxx
+       OPENAI_API_BASE=https://api.openai.com/v1
+       OPENAI_MODEL_ID=gpt-4o-mini
+   - 注意：不要把 .env 提交到仓库。已在 .gitignore 中忽略。
+
+3) 安装依赖
+   - 建议先创建虚拟环境，然后在项目根运行：
+       pip install -e .[openai,toolkit]
+     说明：
+       - openai 可选集包含 openai SDK
+       - toolkit 可选集包含一些工具依赖（如 markdownify 等）。本脚本使用的 WebSearchTool 不需要额外依赖。
+
+4) 运行
+   - 右键 examples/run_agent_pycharm.py -> Run
+   - 或配置 Run/Debug 后点击运行
+
+5) 常见问题
+   - 报错 Missing OPENAI_API_KEY：请按上面配置环境变量
+   - 代理网络：如需代理，请在环境变量里设置 HTTPS_PROXY/HTTP_PROXY
+   - 工具超时：WebSearchTool 依赖外网访问，网络不通会失败，可暂时移除工具仅生成不检索的行程：
+       将 tools=[] 并调整 Prompt 更具体
