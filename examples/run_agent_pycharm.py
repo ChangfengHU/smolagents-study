@@ -47,14 +47,16 @@ def main() -> None:
         model=model,
         verbosity_level=1,
         stream_outputs=True,
+        planning_interval=3,
         name="tokyo_trip_agent",
         description="Generate a 3-day Tokyo itinerary with 2 attractions per day and reasons.",
     )
 
-    result = agent.run(PROMPT)
-
+    # result = agent.run(PROMPT)
+    for step in agent.run(PROMPT, stream=True):
+        print(f"收到步骤: {step}")  # 🔥 最终接收到所有event
     print("\n=== 最终结果 ===\n")
-    print(result)
+    # print(result)
 
 
 if __name__ == "__main__":

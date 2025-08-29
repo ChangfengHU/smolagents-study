@@ -493,16 +493,25 @@ class RateLimiter:
     """
 
     def __init__(self, requests_per_minute: float | None = None):
+        # 根据传入的 requests_per_minute 参数是否为 None 来确定限制请求的频率是否启用
         self._enabled = requests_per_minute is not None
+        # 如果启用了限制请求的频率，则计算两次请求之间的时间间隔
         self._interval = 60.0 / requests_per_minute if self._enabled else 0.0
+        # 初始化上一次请求的时间为 0.0
         self._last_call = 0.0
 
     def throttle(self):
-        """Pause execution to respect the rate limit, if enabled."""
+        """如果启用了速率限制，则暂停执行以遵守速率限制。"""
+        # 如果速率限制未启用，则直接返回，不进行暂停
         if not self._enabled:
             return
+        # 获取当前时间戳
         now = time.time()
+        # 计算距离上次调用的时间间隔
         elapsed = now - self._last_call
+        # 如果时间间隔小于设定的间隔时间，则暂停一段时间
         if elapsed < self._interval:
+            # 计算需要暂停的时间，并调用time.sleep()函数进行暂停
             time.sleep(self._interval - elapsed)
+        # 更新上次调用的时间戳为当前时间，用于下一次调用时计算时间间隔
         self._last_call = time.time()

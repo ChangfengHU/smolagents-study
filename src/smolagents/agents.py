@@ -102,14 +102,16 @@ def get_variable_names(self, template: str) -> set[str]:
     pattern = re.compile(r"\{\{([^{}]+)\}\}")
     return {match.group(1).strip() for match in pattern.finditer(template)}
 
-
 def populate_template(template: str, variables: dict[str, Any]) -> str:
+    # 使用 jinja2 模板引擎，创建模板对象 compiled_template
+    # 设置 undefined=StrictUndefined，确保在模板中使用未定义的变量时会抛出异常
     compiled_template = Template(template, undefined=StrictUndefined)
     try:
+        # 使用传入的 variables 字典渲染模板，并返回渲染后的结果
         return compiled_template.render(**variables)
     except Exception as e:
+        # 捕获任何渲染过程中的异常，并抛出包含详细错误信息的新异常
         raise Exception(f"Error during jinja template rendering: {type(e).__name__}: {e}")
-
 
 @dataclass
 class ActionOutput:
@@ -435,7 +437,6 @@ class MultiStepAgent(ABC):
                 raise ValueError("step_callbacks must be a list or a dict")
         # Register monitor update_metrics only for ActionStep for backward compatibility
         self.step_callbacks.register(ActionStep, self.monitor.update_metrics)
-
     def run(
         self,
         task: str,
@@ -447,38 +448,39 @@ class MultiStepAgent(ABC):
         return_full_result: bool | None = None,
     ) -> Any | RunResult:
         """
-        Run the agent for the given task.
+        运行代理以执行给定任务。
 
         Args:
-            task (`str`): Task to perform.
-            stream (`bool`): Whether to run in streaming mode.
-                If `True`, returns a generator that yields each step as it is executed. You must iterate over this generator to process the individual steps (e.g., using a for loop or `next()`).
-                If `False`, executes all steps internally and returns only the final answer after completion.
-            reset (`bool`): Whether to reset the conversation or keep it going from previous run.
-            images (`list[PIL.Image.Image]`, *optional*): Image(s) objects.
-            additional_args (`dict`, *optional*): Any other variables that you want to pass to the agent run, for instance images or dataframes. Give them clear names!
-            max_steps (`int`, *optional*): Maximum number of steps the agent can take to solve the task. if not provided, will use the agent's default value.
-            return_full_result (`bool`, *optional*): Whether to return the full [`RunResult`] object or just the final answer output.
-                If `None` (default), the agent's `self.return_full_result` setting is used.
+            task (`str`): 要执行的任务。
+            stream (`bool`): 是否以流模式运行。
+                如果为 `True`，则返回一个生成器，逐步返回每个步骤的执行结果。您必须迭代此生成器以处理各个步骤（例如，使用 for 循环或 `next()`）。
+                如果为 `False`，则在内部执行所有步骤，并仅在完成后返回最终答案。
+            reset (`bool`): 是否重置对话或继续上次运行的对话。
+            images (`list[PIL.Image.Image]`, *optional*): 图像对象。
+            additional_args (`dict`, *optional*): 您想要传递给代理运行的任何其他变量，例如图像或数据框。请使用清晰的名称！
+            max_steps (`int`, *optional*): 代理可用于解决任务的最大步数。如果未提供，则使用代理的默认值。
+            return_full_result (`bool`, *optional*): 是否返回完整的 [`RunResult`] 对象或仅返回最终答案输出。
+                如果为 `None`（默认值），则使用代理的 `self.return_full_result` 设置。
 
         Example:
-        ```py
-        from smolagents import CodeAgent
+                from smolagents import CodeAgent
         agent = CodeAgent(tools=[])
         agent.run("What is the result of 2 power 3.7384?")
-        ```
-        """
+                """
+        # 如果未提供最大步数，则使用默认最大步数
         max_steps = max_steps or self.max_steps
         self.task = task
         self.interrupt_switch = False
         if additional_args:
+            # 更新状态以包含额外参数
             self.state.update(additional_args)
             self.task += f"""
-You have been provided with these additional arguments, that you can access directly using the keys as variables:
+您已提供这些额外参数，您可以直接使用键作为变量进行访问：
 {str(additional_args)}."""
 
         self.memory.system_prompt = SystemPromptStep(system_prompt=self.system_prompt)
         if reset:
+            # 重置内存和监视器
             self.memory.reset()
             self.monitor.reset()
 
@@ -491,44 +493,60 @@ You have been provided with these additional arguments, that you can access dire
         self.memory.steps.append(TaskStep(task=self.task, task_images=images))
 
         if getattr(self, "python_executor", None):
+            # 发送变量和工具到 Python 执行器
             self.python_executor.send_variables(variables=self.state)
             self.python_executor.send_tools({**self.tools, **self.managed_agents})
 
         if stream:
-            # The steps are returned as they are executed through a generator to iterate on.
+            # 以生成器形式返回逐步执行的步骤
             return self._run_stream(task=self.task, max_steps=max_steps, images=images)
         run_start_time = time.time()
-        # Outputs are returned only at the end. We only look at the last step.
+        # 仅在最后返回输出。只查看最后一步。
 
+        # 通过调用 self._run_stream 方法执行任务，获取步骤列表，并转换为列表类型
         steps = list(self._run_stream(task=self.task, max_steps=max_steps, images=images))
+        # 断言 steps 列表中最后一个元素的类型为 FinalAnswerStep 类型，确保最后一个步骤是 FinalAnswerStep 类型
         assert isinstance(steps[-1], FinalAnswerStep)
+        # 获取最后一个步骤的输出作为结果
         output = steps[-1].output
-
+        # 如果 return_full_result 为 None，则使用 self.return_full_result 的值
         return_full_result = return_full_result if return_full_result is not None else self.return_full_result
+
+        # 如果 return_full_result 为 True，则执行以下逻辑
         if return_full_result:
             total_input_tokens = 0
             total_output_tokens = 0
             correct_token_usage = True
+
+            # 遍历 self.memory.steps 中的每一个 step
             for step in self.memory.steps:
+                # 如果 step 是 ActionStep 或 PlanningStep 类型
                 if isinstance(step, (ActionStep, PlanningStep)):
+                    # 检查 token_usage 是否为 None
                     if step.token_usage is None:
                         correct_token_usage = False
                         break
                     else:
+                        # 累加输入和输出 token 数量
                         total_input_tokens += step.token_usage.input_tokens
                         total_output_tokens += step.token_usage.output_tokens
+
+            # 如果所有 step 的 token_usage 都不为 None，则创建 TokenUsage 对象，否则为 None
             if correct_token_usage:
                 token_usage = TokenUsage(input_tokens=total_input_tokens, output_tokens=total_output_tokens)
             else:
                 token_usage = None
 
+            # 如果 self.memory.steps 不为空且最后一个 step 的 error 类型为 AgentMaxStepsError，则状态为 "max_steps_error"，否则为 "success"
             if self.memory.steps and isinstance(getattr(self.memory.steps[-1], "error", None), AgentMaxStepsError):
                 state = "max_steps_error"
             else:
                 state = "success"
 
+            # 获取 self.memory 中所有步骤的详细信息
             step_dicts = self.memory.get_full_steps()
 
+            # 返回 RunResult 对象，包括 output、token_usage、steps、timing 和 state
             return RunResult(
                 output=output,
                 token_usage=token_usage,
@@ -537,45 +555,45 @@ You have been provided with these additional arguments, that you can access dire
                 state=state,
             )
 
+        # 如果 return_full_result 为 False，则返回 output
         return output
-
     def _run_stream(
         self, task: str, max_steps: int, images: list["PIL.Image.Image"] | None = None
     ) -> Generator[ActionStep | PlanningStep | FinalAnswerStep | ChatMessageStreamDelta]:
-        self.step_number = 1
-        returned_final_answer = False
-        while not returned_final_answer and self.step_number <= max_steps:
-            if self.interrupt_switch:
-                raise AgentError("Agent interrupted.", self.logger)
+        self.step_number = 1  # 初始化步骤编号为1
+        returned_final_answer = False  # 初始化返回最终答案为False
+        while not returned_final_answer and self.step_number <= max_steps:  # 当未返回最终答案且步骤编号小于等于最大步骤数时执行循环
+            if self.interrupt_switch:  # 如果中断开关为True
+                raise AgentError("Agent interrupted.", self.logger)  # 抛出代理错误，提示代理被中断
 
-            # Run a planning step if scheduled
+            # 如果计划间隔不为None且当前步骤为第一步或者当前步骤减去1能整除计划间隔时执行计划步骤
             if self.planning_interval is not None and (
                 self.step_number == 1 or (self.step_number - 1) % self.planning_interval == 0
             ):
-                planning_start_time = time.time()
+                planning_start_time = time.time()  # 记录计划开始时间
                 planning_step = None
                 for element in self._generate_planning_step(
                     task, is_first_step=len(self.memory.steps) == 1, step=self.step_number
-                ):  # Don't use the attribute step_number here, because there can be steps from previous runs
-                    yield element
-                    planning_step = element
-                assert isinstance(planning_step, PlanningStep)  # Last yielded element should be a PlanningStep
-                planning_end_time = time.time()
+                ):  # 生成计划步骤
+                    yield element  # 生成器返回元素
+                    planning_step = element  # 记录最后一个生成的计划步骤
+                assert isinstance(planning_step, PlanningStep)  # 断言最后一个生成的元素是PlanningStep类型
+                planning_end_time = time.time()  # 记录计划结束时间
                 planning_step.timing = Timing(
                     start_time=planning_start_time,
                     end_time=planning_end_time,
-                )
-                self._finalize_step(planning_step)
-                self.memory.steps.append(planning_step)
+                )  # 设置计划步骤的时间信息
+                self._finalize_step(planning_step)  # 完成计划步骤的最终处理
+                self.memory.steps.append(planning_step)  # 将计划步骤添加到内存中的步骤列表中
 
-            # Start action step!
-            action_step_start_time = time.time()
+            # 开始执行动作步骤！
+            action_step_start_time = time.time()  # 记录动作步骤开始时间
             action_step = ActionStep(
                 step_number=self.step_number,
                 timing=Timing(start_time=action_step_start_time),
                 observations_images=images,
-            )
-            self.logger.log_rule(f"Step {self.step_number}", level=LogLevel.INFO)
+            )  # 创建动作步骤对象
+            self.logger.log_rule(f"Step {self.step_number}", level=LogLevel.INFO)  # 记录日志，提示当前步骤编号
             try:
                 for output in self._step_stream(action_step):
                     # Yield all
@@ -634,12 +652,14 @@ You have been provided with these additional arguments, that you can access dire
         self._finalize_step(final_memory_step)
         self.memory.steps.append(final_memory_step)
         return final_answer.content
-
+    # 生成规划步骤的生成器函数，返回 ChatMessageStreamDelta 或 PlanningStep 类型的对象
     def _generate_planning_step(
         self, task, is_first_step: bool, step: int
     ) -> Generator[ChatMessageStreamDelta | PlanningStep]:
         start_time = time.time()
+        # 如果是第一步
         if is_first_step:
+            # 构建用户输入消息
             input_messages = [
                 ChatMessage(
                     role=MessageRole.USER,
@@ -654,6 +674,7 @@ You have been provided with these additional arguments, that you can access dire
                     ],
                 )
             ]
+            # 如果支持流式输出且模型具有生成流的方法
             if self.stream_outputs and hasattr(self.model, "generate_stream"):
                 plan_message_content = ""
                 output_stream = self.model.generate_stream(input_messages, stop_sequences=["<end_plan>"])  # type: ignore
@@ -668,7 +689,8 @@ You have been provided with these additional arguments, that you can access dire
                                 input_tokens = event.token_usage.input_tokens
                         yield event
             else:
-                plan_message = self.model.generate(input_messages, stop_sequences=["<end_plan>"])
+                # 生成规划消息
+                plan_message = self.model.generate(input_messages, stop_sequences=["<end_plan"])
                 plan_message_content = plan_message.content
                 input_tokens, output_tokens = (
                     (
@@ -678,12 +700,13 @@ You have been provided with these additional arguments, that you can access dire
                     if plan_message.token_usage
                     else (None, None)
                 )
+            # 生成规划
             plan = textwrap.dedent(
-                f"""Here are the facts I know and the plan of action that I will follow to solve the task:\n```\n{plan_message_content}\n```"""
+                f"""Here are the facts I know and the plan of action that I will follow to solve the task:\n\n{plan_message_content}\n"""
             )
         else:
-            # Summary mode removes the system prompt and previous planning messages output by the model.
-            # Removing previous planning messages avoids influencing too much the new plan.
+            # 摘要模式移除系统提示和模型输出的先前规划消息
+            # 移除先前的规划消息避免过多影响新计划
             memory_messages = self.write_memory_to_messages(summary_mode=True)
             plan_update_pre = ChatMessage(
                 role=MessageRole.SYSTEM,
@@ -730,6 +753,7 @@ You have been provided with these additional arguments, that you can access dire
                                 input_tokens = event.token_usage.input_tokens
                         yield event
             else:
+                # 生成规划消息
                 plan_message = self.model.generate(input_messages, stop_sequences=["<end_plan>"])
                 plan_message_content = plan_message.content
                 if plan_message.token_usage is not None:
@@ -737,10 +761,12 @@ You have been provided with these additional arguments, that you can access dire
                         plan_message.token_usage.input_tokens,
                         plan_message.token_usage.output_tokens,
                     )
+            # 生成规划
             plan = textwrap.dedent(
-                f"""I still need to solve the task I was given:\n```\n{self.task}\n```\n\nHere are the facts I know and my new/updated plan of action to solve the task:\n```\n{plan_message_content}\n```"""
+                f"""I still need to solve the task I was given:\n\n{self.task}\n\n\nHere are the facts I know and my new/updated plan of action to solve the task:\n\n{plan_message_content}\n"""
             )
         log_headline = "Initial plan" if is_first_step else "Updated plan"
+        # 记录规划步骤
         self.logger.log(Rule(f"[bold]{log_headline}", style="orange"), Text(plan), level=LogLevel.INFO)
         yield PlanningStep(
             model_input_messages=input_messages,
@@ -749,7 +775,6 @@ You have been provided with these additional arguments, that you can access dire
             token_usage=TokenUsage(input_tokens=input_tokens, output_tokens=output_tokens),
             timing=Timing(start_time=start_time, end_time=time.time()),
         )
-
     @abstractmethod
     def initialize_system_prompt(self) -> str:
         """To be implemented in child classes"""
@@ -1586,23 +1611,30 @@ class CodeAgent(MultiStepAgent):
             self.python_executor.cleanup()
 
     def create_python_executor(self) -> PythonExecutor:
+        # 如果执行器类型为"local"，则创建本地Python执行器
         if self.executor_type == "local":
+            # 使用LocalPythonExecutor类创建本地Python执行器实例
+            # 传入额外授权的导入模块和执行器参数
             return LocalPythonExecutor(
                 self.additional_authorized_imports,
                 **{"max_print_outputs_length": self.max_print_outputs_length} | self.executor_kwargs,
             )
         else:
+            # 如果执行器类型不是"local"
+            # 检查是否启用了托管代理，如果启用了，则抛出异常
             if self.managed_agents:
                 raise Exception("Managed agents are not yet supported with remote code execution.")
+            # 远程执行器字典，根据执行器类型选择对应的远程执行器类
             remote_executors = {
                 "e2b": E2BExecutor,
                 "docker": DockerExecutor,
                 "wasm": WasmExecutor,
             }
+            # 根据执行器类型创建对应的远程执行器实例
+            # 传入额外授权的导入模块、日志记录器和执行器参数
             return remote_executors[self.executor_type](
                 self.additional_authorized_imports, self.logger, **self.executor_kwargs
             )
-
     def initialize_system_prompt(self) -> str:
         system_prompt = populate_template(
             self.prompt_templates["system_prompt"],

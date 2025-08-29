@@ -54,6 +54,24 @@ Full documentation can be found [here](https://huggingface.co/docs/smolagents/in
 First install the package with a default set of tools:
 ```bash
 pip install smolagents[toolkit]
+
+  🚀 一键安装命令
+
+  安装所有依赖（推荐）：
+  /usr/local/bin/python3.12 -m pip install --user "smolagents[all]" --break-system-packages
+
+  如果只需要特定功能，可以选择：
+
+  1. RAG相关（你当前需要的）：
+  /usr/local/bin/python3.12 -m pip install --user "smolagents[transformers,toolkit]" --break-system-packages
+
+  2. OpenAI支持：
+  /usr/local/bin/python3.12 -m pip install --user "smolagents[openai,transformers]" --break-system-packages
+
+  3. 完整的ML工具链：
+  /usr/local/bin/python3.12 -m pip install --user "smolagents[transformers,torch,toolkit,openai]" --break-system-packages
+
+
 ```
 Then define your agent, give it the tools it needs and run it!
 ```py
@@ -64,6 +82,32 @@ agent = CodeAgent(tools=[WebSearchTool()], model=model, stream_outputs=True)
 
 agent.run("How many seconds would it take for a leopard at full speed to run through Pont des Arts?")
 ```
+
+⏺ 📋 一键安装方案总结
+
+  方法1：安装全部功能（最简单）
+  pip install "smolagents[all]"
+
+  方法2：按需安装（你的情况）
+  pip install "smolagents[transformers,toolkit,openai]"
+
+  方法3：查看requirements文件
+  很多项目还会提供 requirements.txt 文件：
+
+
+  你可以直接使用项目提供的 requirements 文件：
+
+  方法1：使用项目的 requirements 文件
+  /usr/local/bin/python3.12 -m pip install --user -r examples/open_deep_research/requirements.txt --break-system-packages
+
+  方法2：使用 pyproject.toml 的组合依赖
+  /usr/local/bin/python3.12 -m pip install --user "smolagents[all]" --break-system-packages
+
+  方法3：针对你当前的RAG示例
+  /usr/local/bin/python3.12 -m pip install --user "smolagents[transformers,toolkit,openai]" datasets langchain langchain-chroma langchain-huggingface --break-system-packages
+
+
+
 
 https://github.com/user-attachments/assets/84b149b4-246c-40c9-a48d-ba013b08e600
 

@@ -226,7 +226,9 @@ class AgentMemory:
     """
 
     def __init__(self, system_prompt: str):
+        # 创建一个SystemPromptStep对象，并将其赋值给self.system_prompt变量
         self.system_prompt: SystemPromptStep = SystemPromptStep(system_prompt=system_prompt)
+        # 初始化一个空列表，用于存放TaskStep、ActionStep和PlanningStep类型的步骤对象
         self.steps: list[TaskStep | ActionStep | PlanningStep] = []
 
     def reset(self):
@@ -287,30 +289,32 @@ class CallbackRegistry:
         self._callbacks: dict[Type[MemoryStep], list[Callable]] = {}
 
     def register(self, step_cls: Type[MemoryStep], callback: Callable):
-        """Register a callback for a step class.
+        """为一个步骤类注册回调函数。
 
         Args:
-            step_cls (Type[MemoryStep]): Step class to register the callback for.
-            callback (Callable): Callback function to register.
+            step_cls (Type[MemoryStep]): 要注册回调函数的步骤类。
+            callback (Callable): 要注册的回调函数。
         """
+        # 如果步骤类不在回调函数字典中，则将其添加到字典中，并初始化为一个空列表
         if step_cls not in self._callbacks:
             self._callbacks[step_cls] = []
+        # 将回调函数添加到对应步骤类的回调函数列表中
         self._callbacks[step_cls].append(callback)
-
     def callback(self, memory_step, **kwargs):
-        """Call callbacks registered for a step type.
+        """调用注册在特定步骤类型上的回调函数。
 
         Args:
-            memory_step (MemoryStep): Step to call the callbacks for.
-            **kwargs: Additional arguments to pass to callbacks that accept them.
-                Typically, includes the agent instance.
+            memory_step (MemoryStep): 要调用回调函数的步骤。
+            **kwargs: 传递给接受额外参数的回调函数的附加参数。
+                通常包括代理实例。
 
         Notes:
-            For backwards compatibility, callbacks with a single parameter signature
-            receive only the memory_step, while callbacks with multiple parameters
-            receive both the memory_step and any additional kwargs.
+            为了向后兼容，只接受单个参数的回调函数将仅接收 memory_step，
+            而接受多个参数的回调函数将同时接收 memory_step 和任何额外的 kwargs。
         """
-        # For compatibility with old callbacks that only take the step as an argument
+        # 为了兼容旧的回调函数，这些函数只接受步骤作为参数
         for cls in memory_step.__class__.__mro__:
+            # 遍历步骤类的方法解析顺序，找到注册在该类上的回调函数
             for cb in self._callbacks.get(cls, []):
+                # 检查回调函数的参数个数，根据参数个数调用不同方式的回调函数
                 cb(memory_step) if len(inspect.signature(cb).parameters) == 1 else cb(memory_step, **kwargs)

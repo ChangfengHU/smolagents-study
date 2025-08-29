@@ -114,14 +114,18 @@ class ChatMessage:
 
     @classmethod
     def from_dict(cls, data: dict, raw: Any | None = None, token_usage: TokenUsage | None = None) -> "ChatMessage":
+        # 如果数据字典中存在键"tool_calls"
         if data.get("tool_calls"):
+            # 将"tool_calls"中的数据转换为ChatMessageToolCall对象列表
             tool_calls = [
                 ChatMessageToolCall(
                     function=ChatMessageToolCallFunction(**tc["function"]), id=tc["id"], type=tc["type"]
                 )
                 for tc in data["tool_calls"]
             ]
+            # 将转换后的对象列表替换原始数据字典中的"tool_calls"键对应的值
             data["tool_calls"] = tool_calls
+        # 返回一个ChatMessage对象，使用数据字典中的值初始化对象的属性
         return cls(
             role=data["role"],
             content=data.get("content"),
@@ -129,7 +133,6 @@ class ChatMessage:
             raw=raw,
             token_usage=token_usage,
         )
-
     def dict(self):
         return get_dict_from_nested_dataclasses(self)
 
@@ -1535,46 +1538,62 @@ class OpenAIServerModel(ApiModel):
         **kwargs,
     ) -> Generator[ChatMessageStreamDelta]:
         completion_kwargs = self._prepare_completion_kwargs(
-            messages=messages,
-            stop_sequences=stop_sequences,
-            response_format=response_format,
-            tools_to_call_from=tools_to_call_from,
-            model=self.model_id,
-            custom_role_conversions=self.custom_role_conversions,
-            convert_images_to_image_urls=True,
+            messages=messages,  # 用户提示信息
+            stop_sequences=stop_sequences,  # 停止序列
+            response_format=response_format,  # 响应格式
+            tools_to_call_from=tools_to_call_from,  # 调用工具
+            model=self.model_id,  # 模型ID
+            custom_role_conversions=self.custom_role_conversions,  # 自定义角色转换
+            convert_images_to_image_urls=True,  # 将图片转换为图片URL
             **kwargs,
         )
         self._apply_rate_limit()
+        # 通过调用self.client.chat.completions.create()方法生成聊天补全结果，并使用stream=True参数开启流式处理
+        # stream_options={"include_usage": True}用于指定流选项，其中包括使用情况信息
         for event in self.client.chat.completions.create(
             **completion_kwargs, stream=True, stream_options={"include_usage": True}
         ):
+            # 检查当前事件是否包含使用情况信息
             if event.usage:
+                # 使用yield关键字返回ChatMessageStreamDelta对象，生成一个生成器
                 yield ChatMessageStreamDelta(
-                    content="",
-                    token_usage=TokenUsage(
-                        input_tokens=event.usage.prompt_tokens,
-                        output_tokens=event.usage.completion_tokens,
+                    content="",  # 初始化内容为空字符串
+                    token_usage=TokenUsage(  # 创建TokenUsage对象，用于存储输入和输出的token信息
+                        input_tokens=event.usage.prompt_tokens,  # 将当前事件的输入token存储为TokenUsage对象的输入token
+                        output_tokens=event.usage.completion_tokens,  # 将当前事件的输出token存储为TokenUsage对象的输出token
                     ),
                 )
             if event.choices:
                 choice = event.choices[0]
+                # 如果choice对象中存在delta属性
                 if choice.delta:
+                    # 生成一个ChatMessageStreamDelta对象，并返回
                     yield ChatMessageStreamDelta(
+                        # 设置content属性为choice.delta.content
                         content=choice.delta.content,
+                        # 设置tool_calls属性为一个列表推导式，遍历choice.delta.tool_calls中的每一个delta对象
                         tool_calls=[
                             ChatMessageToolCallStreamDelta(
+                                # 设置index属性为delta.index
                                 index=delta.index,
+                                # 设置id属性为delta.id
                                 id=delta.id,
+                                # 设置type属性为delta.type
                                 type=delta.type,
+                                # 设置function属性为delta.function
                                 function=delta.function,
                             )
                             for delta in choice.delta.tool_calls
                         ]
+                        # 如果choice.delta.tool_calls存在，则设置tool_calls属性为生成的列表，否则设置为None
                         if choice.delta.tool_calls
                         else None,
                     )
+                # 如果choice对象中不存在delta属性
                 else:
+                    # 如果choice对象中不存在finish_reason属性，或者finish_reason属性的值为None
                     if not getattr(choice, "finish_reason", None):
+                        # 抛出ValueError异常，提示事件中没有内容或工具调用
                         raise ValueError(f"No content or tool calls in event: {event}")
 
     def generate(
@@ -1586,17 +1605,20 @@ class OpenAIServerModel(ApiModel):
         **kwargs,
     ) -> ChatMessage:
         completion_kwargs = self._prepare_completion_kwargs(
-            messages=messages,
-            stop_sequences=stop_sequences,
-            response_format=response_format,
-            tools_to_call_from=tools_to_call_from,
-            model=self.model_id,
-            custom_role_conversions=self.custom_role_conversions,
-            convert_images_to_image_urls=True,
+            messages=messages,  # 用户提示字符串：消息
+            stop_sequences=stop_sequences,  # 用户提示字符串：停止序列
+            response_format=response_format,  # 用户提示字符串：响应格式
+            tools_to_call_from=tools_to_call_from,  # 用户提示字符串：调用工具
+            model=self.model_id,  # 用户提示字符串：模型ID
+            custom_role_conversions=self.custom_role_conversions,  # 用户提示字符串：自定义角色转换
+            convert_images_to_image_urls=True,  # 用户提示字符串：将图片转换为图片URL
             **kwargs,
         )
         self._apply_rate_limit()
+        # 调用client对象的chat.completions.create方法，并传入completion_kwargs参数，获取对话完成的响应结果
         response = self.client.chat.completions.create(**completion_kwargs)
+        # 从响应结果中获取第一个选择项的消息内容，包括"role"、"content"和"tool_calls"字段，构建ChatMessage对象
+        # 并将原始响应结果作为raw参数传入，同时构建TokenUsage对象，包括输入和输出的token使用情况
         return ChatMessage.from_dict(
             response.choices[0].message.model_dump(include={"role", "content", "tool_calls"}),
             raw=response,
