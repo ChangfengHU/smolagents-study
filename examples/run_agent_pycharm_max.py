@@ -18,7 +18,7 @@ from dotenv import load_dotenv  # type: ignore
 import time
 
 # 设置OpenAI API
-os.environ["OPENAI_API_KEY"] = "your-api-key-here"
+
 
 
 def create_custom_tools():
