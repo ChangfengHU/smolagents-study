@@ -789,9 +789,9 @@ class MultiStepAgent(ABC):
         summary_mode: bool = False,
     ) -> list[ChatMessage]:
         """
-        Reads past llm_outputs, actions, and observations or errors from the memory into a series of messages
-        that can be used as input to the LLM. Adds a number of keywords (such as PLAN, error, etc) to help
-        the LLM.
+        将过去的llm_output，动作和观察结果或错误从内存中读取到一系列消息中
+        可以用作LLM的输入。添加了许多关键字（例如计划，错误等）来帮助
+        LLM。
         """
         messages = self.memory.system_prompt.to_messages(summary_mode=summary_mode)
         for memory_step in self.memory.steps:
@@ -1557,15 +1557,19 @@ class CodeAgent(MultiStepAgent):
         self.authorized_imports = sorted(set(BASE_BUILTIN_MODULES) | set(self.additional_authorized_imports))
         self.max_print_outputs_length = max_print_outputs_length
         self._use_structured_outputs_internally = use_structured_outputs_internally
+        # 如果内部使用结构化输出(_use_structured_outputs_internally为True)，则加载结构化代码代理的提示模板
         if self._use_structured_outputs_internally:
+            # 如果未提供提示模板，则使用yaml.safe_load加载结构化代码代理的默认提示模板
             prompt_templates = prompt_templates or yaml.safe_load(
                 importlib.resources.files("smolagents.prompts").joinpath("structured_code_agent.yaml").read_text()
             )
+        # 如果内部不使用结构化输出(_use_structured_outputs_internally为False)，则加载非结构化代码代理的提示模板
         else:
+            # 如果未提供提示模板，则使用yaml.safe_load加载非结构化代码代理的默认提示模板
+            # 如果 prompt_templates 为 None 或空值，则加载指定路径下的 code_agent.yaml 文件内容作为默认值
             prompt_templates = prompt_templates or yaml.safe_load(
                 importlib.resources.files("smolagents.prompts").joinpath("code_agent.yaml").read_text()
             )
-
         if isinstance(code_block_tags, str) and not code_block_tags == "markdown":
             raise ValueError("Only 'markdown' is supported for a string argument to `code_block_tags`.")
         self.code_block_tags = (
@@ -1657,9 +1661,9 @@ class CodeAgent(MultiStepAgent):
         self, memory_step: ActionStep
     ) -> Generator[ChatMessageStreamDelta | ToolCall | ToolOutput | ActionOutput]:
         """
-        Perform one step in the ReAct framework: the agent thinks, acts, and observes the result.
-        Yields ChatMessageStreamDelta during the run if streaming is enabled.
-        At the end, yields either None if the step is not final, or the final answer.
+        # 在 ReAct 框架中执行一步操作：代理程序思考、行动，并观察结果。
+        # 如果启用了流式处理，则在运行过程中生成 ChatMessageStreamDelta。
+        # 最后，如果该步骤不是最终步骤，则生成 None；如果是最终步骤，则生成最终答案。
         """
         memory_messages = self.write_memory_to_messages()
 
