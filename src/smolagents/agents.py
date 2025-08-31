@@ -273,33 +273,33 @@ StreamEvent: TypeAlias = Union[
 
 class MultiStepAgent(ABC):
     """
-    Agent class that solves the given task step by step, using the ReAct framework:
-    While the objective is not reached, the agent will perform a cycle of action (given by the LLM) and observation (obtained from the environment).
+    逐步解决给定任务的代理类，使用 ReAct 框架：
+    在未达到目标之前，代理将执行一次动作循环（由 LLM 给出）和观察（从环境中获得）。
 
     Args:
-        tools (`list[Tool]`): [`Tool`]s that the agent can use.
-        model (`Callable[[list[dict[str, str]]], ChatMessage]`): Model that will generate the agent's actions.
-        prompt_templates ([`~agents.PromptTemplates`], *optional*): Prompt templates.
-        instructions (`str`, *optional*): Custom instructions for the agent, will be inserted in the system prompt.
-        max_steps (`int`, default `20`): Maximum number of steps the agent can take to solve the task.
-        add_base_tools (`bool`, default `False`): Whether to add the base tools to the agent's tools.
-        verbosity_level (`LogLevel`, default `LogLevel.INFO`): Level of verbosity of the agent's logs.
-        managed_agents (`list`, *optional*): Managed agents that the agent can call.
-        step_callbacks (`list[Callable]` | `dict[Type[MemoryStep], Callable | list[Callable]]`, *optional*): Callbacks that will be called at each step.
-        planning_interval (`int`, *optional*): Interval at which the agent will run a planning step.
-        name (`str`, *optional*): Necessary for a managed agent only - the name by which this agent can be called.
-        description (`str`, *optional*): Necessary for a managed agent only - the description of this agent.
-        provide_run_summary (`bool`, *optional*): Whether to provide a run summary when called as a managed agent.
-        final_answer_checks (`list[Callable]`, *optional*): List of validation functions to run before accepting a final answer.
-            Each function should:
-            - Take the final answer and the agent's memory as arguments.
-            - Return a boolean indicating whether the final answer is valid.
-        return_full_result (`bool`, default `False`): Whether to return the full [`RunResult`] object or just the final answer output from the agent run.
+        tools (`list[Tool]`): 代理可以使用的工具。
+        model (`Callable[[list[dict[str, str]]], ChatMessage`): 将生成代理动作的模型。
+        prompt_templates ([`~agents.PromptTemplates`], *optional*): 提示模板。
+        instructions (`str`, *optional*): 代理的自定义指令，将插入系统提示中。
+        max_steps (`int`, default `20`): 代理解决任务时可以采取的最大步数。
+        add_base_tools (`bool`, default `False`): 是否将基本工具添加到代理的工具中。
+        verbosity_level (`LogLevel`, default `LogLevel.INFO`): 代理日志的详细级别。
+        managed_agents (`list`, *optional*): 代理可以调用的托管代理。
+        step_callbacks (`list[Callable]` | `dict[Type[MemoryStep], Callable | list[Callable]]`, *optional*): 每个步骤将调用的回调函数。
+        planning_interval (`int`, *optional*): 代理将运行规划步骤的间隔。
+        name (`str`, *optional*): 仅对托管代理必需 - 可以通过此名称调用代理。
+        description (`str`, *optional*): 仅对托管代理必需 - 此代理的描述。
+        provide_run_summary (`bool`, *optional*): 在作为托管代理调用时是否提供运行摘要。
+        final_answer_checks (`list[Callable]`, *optional*): 运行接受最终答案之前运行的验证函数列表。
+            每个函数应：
+            - 接受最终答案和代理的记忆作为参数。
+            - 返回指示最终答案是否有效的布尔值。
+        return_full_result (`bool`, default `False`): 是否返回完整的 [`RunResult`] 对象或仅从代理运行中返回最终答案输出。
     """
 
     def __init__(
         self,
-        tools: list[Tool],
+        tools: list[Tool],  # 初始化方法的参数，包括工具列表、模型、提示模板等
         model: Model,
         prompt_templates: PromptTemplates | None = None,
         instructions: str | None = None,
@@ -316,47 +316,46 @@ class MultiStepAgent(ABC):
         return_full_result: bool = False,
         logger: AgentLogger | None = None,
     ):
-        self.agent_name = self.__class__.__name__
-        self.model = model
-        self.prompt_templates = prompt_templates or EMPTY_PROMPT_TEMPLATES
-        if prompt_templates is not None:
-            missing_keys = set(EMPTY_PROMPT_TEMPLATES.keys()) - set(prompt_templates.keys())
+        self.agent_name = self.__class__.__name__  # 获取当前类的名称
+        self.model = model  # 初始化模型
+        self.prompt_templates = prompt_templates or EMPTY_PROMPT_TEMPLATES  # 如果未提供提示模板，则使用默认空模板
+        if prompt_templates is not None:  # 如果提供了自定义提示模板
+            missing_keys = set(EMPTY_PROMPT_TEMPLATES.keys()) - set(prompt_templates.keys())  # 检查是否有缺失的提示模板键
             assert not missing_keys, (
                 f"Some prompt templates are missing from your custom `prompt_templates`: {missing_keys}"
             )
-            for key, value in EMPTY_PROMPT_TEMPLATES.items():
-                if isinstance(value, dict):
-                    for subkey in value.keys():
+            for key, value in EMPTY_PROMPT_TEMPLATES.items():  # 遍历默认空模板
+                if isinstance(value, dict):  # 如果值是字典
+                    for subkey in value.keys():  # 遍历子键
                         assert key in prompt_templates.keys() and (subkey in prompt_templates[key].keys()), (
                             f"Some prompt templates are missing from your custom `prompt_templates`: {subkey} under {key}"
                         )
 
-        self.max_steps = max_steps
-        self.step_number = 0
-        self.planning_interval = planning_interval
-        self.state: dict[str, Any] = {}
-        self.name = self._validate_name(name)
-        self.description = description
-        self.provide_run_summary = provide_run_summary
-        self.final_answer_checks = final_answer_checks if final_answer_checks is not None else []
-        self.return_full_result = return_full_result
-        self.instructions = instructions
-        self._setup_managed_agents(managed_agents)
-        self._setup_tools(tools, add_base_tools)
-        self._validate_tools_and_managed_agents(tools, managed_agents)
+        self.max_steps = max_steps  # 初始化最大步数
+        self.step_number = 0  # 步数初始化为0
+        self.planning_interval = planning_interval  # 初始化规划间隔
+        self.state: dict[str, Any] = {}  # 初始化状态字典
+        self.name = self._validate_name(name)  # 使用私有方法验证名称
+        self.description = description  # 初始化描述
+        self.provide_run_summary = provide_run_summary  # 是否提供运行摘要
+        self.final_answer_checks = final_answer_checks if final_answer_checks is not None else []  # 初始化最终答案检查列表
+        self.return_full_result = return_full_result  # 是否返回完整结果
+        self.instructions = instructions  # 初始化指令
+        self._setup_managed_agents(managed_agents)  # 设置托管代理
+        self._setup_tools(tools, add_base_tools)  # 设置工具
+        self._validate_tools_and_managed_agents(tools, managed_agents)  # 验证工具和托管代理
 
-        self.task: str | None = None
-        self.memory = AgentMemory(self.system_prompt)
+        self.task: str | None = None  # 任务初始化为空
+        self.memory = AgentMemory(self.system_prompt)  # 初始化代理记忆
 
-        if logger is None:
-            self.logger = AgentLogger(level=verbosity_level)
+        if logger is None:  # 如果未提供日志记录器
+            self.logger = AgentLogger(level=verbosity_level)  # 创建代理日志记录器
         else:
-            self.logger = logger
+            self.logger = logger  # 使用提供的日志记录器
 
-        self.monitor = Monitor(self.model, self.logger)
-        self._setup_step_callbacks(step_callbacks)
-        self.stream_outputs = False
-
+        self.monitor = Monitor(self.model, self.logger)  # 初始化监视器
+        self._setup_step_callbacks(step_callbacks)  # 设置步回调
+        self.stream_outputs = False  # 输出流初始化为False
     @property
     def system_prompt(self) -> str:
         return self.initialize_system_prompt()
@@ -418,15 +417,16 @@ class MultiStepAgent(ABC):
                 f"{[name for name in tool_and_managed_agent_names if tool_and_managed_agent_names.count(name) > 1]}"
             )
 
+
     def _setup_step_callbacks(self, step_callbacks):
-        # Initialize step callbacks registry
+        # 初始化步骤回调注册表
         self.step_callbacks = CallbackRegistry()
         if step_callbacks:
-            # Register callbacks list only for ActionStep for backward compatibility
+            # 为了向后兼容，仅为ActionStep注册回调列表
             if isinstance(step_callbacks, list):
                 for callback in step_callbacks:
                     self.step_callbacks.register(ActionStep, callback)
-            # Register callbacks dict for specific step classes
+            # 为特定步骤类注册回调字典
             elif isinstance(step_callbacks, dict):
                 for step_cls, callbacks in step_callbacks.items():
                     if not isinstance(callbacks, list):
@@ -435,7 +435,7 @@ class MultiStepAgent(ABC):
                         self.step_callbacks.register(step_cls, callback)
             else:
                 raise ValueError("step_callbacks must be a list or a dict")
-        # Register monitor update_metrics only for ActionStep for backward compatibility
+        # 为了向后兼容，仅为ActionStep注册监视器更新指标的回调
         self.step_callbacks.register(ActionStep, self.monitor.update_metrics)
     def run(
         self,

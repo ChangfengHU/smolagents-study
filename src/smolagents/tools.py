@@ -217,27 +217,31 @@ class Tool(BaseTool):
 
     def forward(self, *args, **kwargs):
         raise NotImplementedError("Write this method in your subclass of `Tool`.")
-
     def __call__(self, *args, sanitize_inputs_outputs: bool = False, **kwargs):
+        # 如果Agent对象尚未初始化，则调用setup方法进行初始化
         if not self.is_initialized:
             self.setup()
 
-        # Handle the arguments might be passed as a single dictionary
+        # 处理可能作为单个字典传递的参数
         if len(args) == 1 and len(kwargs) == 0 and isinstance(args[0], dict):
             potential_kwargs = args[0]
 
-            # If the dictionary keys match our input parameters, convert it to kwargs
+            # 如果字典的键与输入参数匹配，则将其转换为kwargs
             if all(key in self.inputs for key in potential_kwargs):
                 args = ()
                 kwargs = potential_kwargs
 
+        # 如果需要对输入输出进行清理处理
         if sanitize_inputs_outputs:
+            # 调用handle_agent_input_types函数对输入参数进行处理
             args, kwargs = handle_agent_input_types(*args, **kwargs)
+        # 调用forward方法进行前向传播计算
         outputs = self.forward(*args, **kwargs)
+        # 如果需要对输入输出进行清理处理
         if sanitize_inputs_outputs:
+            # 调用handle_agent_output_types函数对输出结果进行处理
             outputs = handle_agent_output_types(outputs, self.output_type)
         return outputs
-
     def setup(self):
         """
         Overwrite this method here for any operation that is expensive and needs to be executed before you start using

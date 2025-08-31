@@ -33,39 +33,53 @@ class PreTool:
     task: str
     description: str
     repo_id: str
-
-
 class PythonInterpreterTool(Tool):
+    # 定义 PythonInterpreterTool 类，继承自 Tool 类
     name = "python_interpreter"
     description = "This is a tool that evaluates python code. It can be used to perform calculations."
+    # 工具的名称和描述信息
+
     inputs = {
         "code": {
             "type": "string",
             "description": "The python code to run in interpreter",
         }
     }
+    # 工具的输入参数，包含一个名为"code"的字符串参数
+
     output_type = "string"
+    # 工具的输出类型为字符串
 
     def __init__(self, *args, authorized_imports=None, **kwargs):
+        # 初始化方法，接受可选的 authorized_imports 参数
         if authorized_imports is None:
             self.authorized_imports = list(set(BASE_BUILTIN_MODULES))
         else:
             self.authorized_imports = list(set(BASE_BUILTIN_MODULES) | set(authorized_imports))
+        # 如果 authorized_imports 为 None，则使用基础内置模块；否则使用基础内置模块和传入的 authorized_imports
+
         self.inputs = {
             "code": {
                 "type": "string",
                 "description": (
-                    "The code snippet to evaluate. All variables used in this snippet must be defined in this same snippet, "
-                    f"else you will get an error. This code can only import the following python libraries: {self.authorized_imports}."
+                    "要评估的代码片段。此片段中使用的所有变量必须在此片段中定义，"
+                    f"否则将会出错。此代码只能导入以下 Python 库：{self.authorized_imports}。"
                 ),
             }
         }
+        # 更新 inputs，添加描述信息，指明 code 参数的使用限制
+
         self.base_python_tools = BASE_PYTHON_TOOLS
         self.python_evaluator = evaluate_python_code
+        # 初始化基础 Python 工具和 Python 代码评估器
+
         super().__init__(*args, **kwargs)
+        # 调用父类 Tool 的初始化方法
 
     def forward(self, code: str) -> str:
+        # 定义 forward 方法，接受一个字符串参数 code，返回一个字符串
         state = {}
+        # 初始化状态字典
         output = str(
             self.python_evaluator(
                 code,
@@ -74,7 +88,9 @@ class PythonInterpreterTool(Tool):
                 authorized_imports=self.authorized_imports,
             )[0]  # The second element is boolean is_final_answer
         )
+        # 调用 python_evaluator 方法执行代码，获取输出结果
         return f"Stdout:\n{str(state['_print_outputs'])}\nOutput: {output}"
+        # 返回执行结果和标准输出信息
 
 
 class FinalAnswerTool(Tool):

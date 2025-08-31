@@ -1373,24 +1373,22 @@ def evaluate_ast(
     authorized_imports: list[str] = BASE_BUILTIN_MODULES,
 ):
     """
-    Evaluate an abstract syntax tree using the content of the variables stored in a state and only evaluating a given
-    set of functions.
+    使用存储在状态中的变量内容并仅评估给定函数集的抽象语法树。
 
-    This function will recurse through the nodes of the tree provided.
+    此函数将递归遍历提供的树节点。
 
-    Args:
+    参数:
         expression (`ast.AST`):
-            The code to evaluate, as an abstract syntax tree.
+            要评估的代码，作为抽象语法树。
         state (`Dict[str, Any]`):
-            A dictionary mapping variable names to values. The `state` is updated if need be when the evaluation
-            encounters assignments.
+            将变量名称映射到值的字典。如果在评估过程中遇到赋值，则会更新`state`。
         static_tools (`Dict[str, Callable]`):
-            Functions that may be called during the evaluation. Trying to change one of these static_tools will raise an error.
+            在评估过程中可能被调用的函数。尝试更改这些`static_tools`将引发错误。
         custom_tools (`Dict[str, Callable]`):
-            Functions that may be called during the evaluation. These custom_tools can be overwritten.
+            在评估过程中可能被调用的函数。这些`custom_tools`可以被覆盖。
         authorized_imports (`List[str]`):
-            The list of modules that can be imported by the code. By default, only a few safe modules are allowed.
-            If it contains "*", it will authorize any import. Use this at your own risk!
+            可以被代码导入的模块列表。默认情况下，只允许导入一些安全模块。
+            如果包含“*”，则将授权任何导入。请自行承担风险使用！
     """
     if state.setdefault("_operations_count", {"counter": 0})["counter"] >= MAX_OPERATIONS:
         raise InterpreterError(
@@ -1524,7 +1522,6 @@ class FinalAnswerException(Exception):
     def __init__(self, value):
         self.value = value
 
-
 def evaluate_python_code(
     code: str,
     static_tools: dict[str, Callable] | None = None,
@@ -1534,27 +1531,25 @@ def evaluate_python_code(
     max_print_outputs_length: int = DEFAULT_MAX_LEN_OUTPUT,
 ):
     """
-    Evaluate a python expression using the content of the variables stored in a state and only evaluating a given set
-    of functions.
+    评估Python表达式，使用状态中存储的变量内容，并仅评估给定的函数集。
 
-    This function will recurse through the nodes of the tree provided.
+    此函数将递归遍历提供的树的节点。
 
     Args:
         code (`str`):
-            The code to evaluate.
+            要评估的代码。
         static_tools (`Dict[str, Callable]`):
-            The functions that may be called during the evaluation. These can also be agents in a multiagent setting.
-            These tools cannot be overwritten in the code: any assignment to their name will raise an error.
+            可在评估过程中调用的函数。这些也可以是多智能体设置中的代理。
+            这些工具在代码中不能被覆盖：对它们的任何赋值都会引发错误。
         custom_tools (`Dict[str, Callable]`):
-            The functions that may be called during the evaluation.
-            These tools can be overwritten in the code: any assignment to their name will overwrite them.
+            可在评估过程中调用的函数。
+            这些工具可以在代码中被覆盖：对它们的任何赋值都会覆盖它们。
         state (`Dict[str, Any]`):
-            A dictionary mapping variable names to values. The `state` should contain the initial inputs but will be
-            updated by this function to contain all variables as they are evaluated.
-            The print outputs will be stored in the state under the key "_print_outputs".
+            将变量名映射到值的字典。`state`应包含初始输入，但此函数将更新它以包含所有评估的变量。
+            打印输出将存储在状态下的键"_print_outputs"中。
     """
     try:
-        expression = ast.parse(code)
+        expression = ast.parse(code)  # 将代码解析为抽象语法树
     except SyntaxError as e:
         raise InterpreterError(
             f"Code parsing failed on line {e.lineno} due to: {type(e).__name__}\n"
@@ -1564,29 +1559,36 @@ def evaluate_python_code(
         )
 
     if state is None:
-        state = {}
-    static_tools = static_tools.copy() if static_tools is not None else {}
-    custom_tools = custom_tools if custom_tools is not None else {}
+        state = {}  # 如果状态为None，则初始化为空字典
+    static_tools = static_tools.copy() if static_tools is not None else {}  # 创建静态工具的副本
+    custom_tools = custom_tools if custom_tools is not None else {}  # 如果自定义工具为None，则初始化为空字典
     result = None
-    state["_print_outputs"] = PrintContainer()
-    state["_operations_count"] = {"counter": 0}
+    state["_print_outputs"] = PrintContainer()  # 初始化打印输出容器
+    state["_operations_count"] = {"counter": 0}  # 初始化操作计数器
 
     if "final_answer" in static_tools:
         previous_final_answer = static_tools["final_answer"]
 
-        def final_answer(*args, **kwargs):  # Allow arbitrary arguments to be passed
+        def final_answer(*args, **kwargs):  # 允许传递任意参数
             raise FinalAnswerException(previous_final_answer(*args, **kwargs))
 
         static_tools["final_answer"] = final_answer
 
     try:
+        # 遍历表达式的每个节点
         for node in expression.body:
+            # 对每个节点进行抽象语法树的评估，获取结果
             result = evaluate_ast(node, state, static_tools, custom_tools, authorized_imports)
-        state["_print_outputs"].value = truncate_content(
-            str(state["_print_outputs"]), max_length=max_print_outputs_length
-        )
+
+        # 截断打印输出内容，限制长度为max_print_outputs_length
+        state["_print_outputs"].value = truncate_content(str(state["_print_outputs"]), max_length=max_print_outputs_length)
+
+        # 标记是否为最终答案的标志，初始值为False
         is_final_answer = False
+
+        # 返回评估结果和是否为最终答案的标志
         return result, is_final_answer
+    #这段代码的设计意图是对表达式中的每个节点进行抽象语法树的评估，并在评估完成后截断打印输出内容，最后返回评估结果和是否为最终答案的标志。
     except FinalAnswerException as e:
         state["_print_outputs"].value = truncate_content(
             str(state["_print_outputs"]), max_length=max_print_outputs_length
@@ -1600,8 +1602,6 @@ def evaluate_python_code(
         raise InterpreterError(
             f"Code execution failed at line '{ast.get_source_segment(code, node)}' due to: {type(e).__name__}: {e}"
         )
-
-
 @dataclass
 class CodeOutput:
     output: Any

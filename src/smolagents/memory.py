@@ -278,14 +278,14 @@ class AgentMemory:
             [step.code_action for step in self.steps if isinstance(step, ActionStep) and step.code_action is not None]
         )
 
-
 class CallbackRegistry:
-    """Registry for callbacks that are called at each step of the agent's execution.
+    """代理程序执行每个步骤时调用的回调函数注册表。
 
-    Callbacks are registered by passing a step class and a callback function.
+    通过传递一个步骤类和一个回调函数来注册回调函数。
     """
 
     def __init__(self):
+        # 使用字典存储每个步骤类对应的回调函数列表
         self._callbacks: dict[Type[MemoryStep], list[Callable]] = {}
 
     def register(self, step_cls: Type[MemoryStep], callback: Callable):
@@ -317,4 +317,6 @@ class CallbackRegistry:
             # 遍历步骤类的方法解析顺序，找到注册在该类上的回调函数
             for cb in self._callbacks.get(cls, []):
                 # 检查回调函数的参数个数，根据参数个数调用不同方式的回调函数
+                # 如果回调函数只接受一个参数，则直接传入 memory_step
+                # 如果回调函数接受多个参数，则使用 **kwargs 传入额外参数
                 cb(memory_step) if len(inspect.signature(cb).parameters) == 1 else cb(memory_step, **kwargs)
