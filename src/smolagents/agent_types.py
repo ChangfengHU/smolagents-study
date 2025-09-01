@@ -259,14 +259,14 @@ def handle_agent_input_types(*args, **kwargs):
     kwargs = {k: (v.to_raw() if isinstance(v, AgentType) else v) for k, v in kwargs.items()}
     return args, kwargs
 
-
 def handle_agent_output_types(output: Any, output_type: str | None = None) -> Any:
+    # 如果输出类型在_AGENT_TYPE_MAPPING中定义
     if output_type in _AGENT_TYPE_MAPPING:
-        # If the class has defined outputs, we can map directly according to the class definition
+        # 如果类定义了输出类型，则根据类定义直接进行映射
         decoded_outputs = _AGENT_TYPE_MAPPING[output_type](output)
         return decoded_outputs
 
-    # If the class does not have defined output, then we map according to the type
+    # 如果类没有定义输出类型，则根据类型进行映射
     if isinstance(output, str):
         return AgentText(output)
     if isinstance(output, PIL.Image.Image):
@@ -274,11 +274,12 @@ def handle_agent_output_types(output: Any, output_type: str | None = None) -> An
     try:
         import torch
 
+        # 尝试导入torch模块，如果输出是torch.Tensor类型，则返回AgentAudio对象
         if isinstance(output, torch.Tensor):
             return AgentAudio(output)
     except ModuleNotFoundError:
         pass
+    # 其他情况直接返回原始输出
     return output
-
 
 __all__ = ["AgentType", "AgentImage", "AgentText", "AgentAudio"]

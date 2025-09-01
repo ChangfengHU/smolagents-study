@@ -284,27 +284,28 @@ def get_iterable(obj):
 
 def fix_final_answer_code(code: str) -> str:
     """
-    Sometimes an LLM can try to assign a variable to final_answer, which would break the final_answer() tool.
-    This function fixes this behaviour by replacing variable assignments to final_answer with final_answer_variable,
-    while preserving function calls to final_answer().
+    # 有时 LLM 可能会尝试将一个变量分配给 final_answer，这会破坏 final_answer() 工具。
+    # 这个函数通过将变量分配替换为 final_answer_variable 来修复这种行为，
+    # 同时保留对 final_answer() 的函数调用。
     """
-    # First, find if there's a direct assignment to final_answer
-    # Use word boundary and negative lookbehind to ensure it's not an object attribute
+
+    # 首先，查找是否有直接赋值给 final_answer 的情况
+    # 使用单词边界和负向回顾来确保它不是对象属性
     assignment_pattern = r"(?<!\.)(?<!\w)\bfinal_answer\s*="
     if "final_answer(" not in code or not re.search(assignment_pattern, code):
-        # If final_answer tool is not called in this blob, then doing the replacement is hazardous because it could false the model's memory for next steps.
-        # Let's not modify the code and leave the subsequent assignment error happen.
+        # 如果在此代码块中未调用 final_answer 工具，则进行替换是危险的，因为这可能会导致模型在后续步骤中出现错误。
+        # 让我们不修改代码，让后续的赋值错误发生。
         return code
 
-    # Pattern for replacing variable assignments
-    # Looks for 'final_answer' followed by '=' with optional whitespace
-    # Negative lookbehind ensures we don't match object attributes
+    # 用于替换变量赋值的模式
+    # 查找 'final_answer' 后面跟着 '='，并带有可选的空白字符
+    # 负向回顾确保我们不匹配对象属性
     assignment_regex = r"(?<!\.)(?<!\w)(\bfinal_answer)(\s*=)"
     code = re.sub(assignment_regex, r"final_answer_variable\2", code)
 
-    # Pattern for replacing variable usage but not function calls
-    # Negative lookahead (?!\s*\() ensures we don't match function calls
-    # Negative lookbehind (?<!\.|\w) ensures we don't match object methods or other variables
+    # 用于替换变量使用但不包括函数调用的模式
+    # 负向预查 (?!\s*\() 确保我们不匹配函数调用
+    # 负向回顾 (?<!\.|\w) 确保我们不匹配对象方法或其他变量
     variable_regex = r"(?<!\.)(?<!\w)(\bfinal_answer\b)(?!\s*\()"
     code = re.sub(variable_regex, "final_answer_variable", code)
     return code

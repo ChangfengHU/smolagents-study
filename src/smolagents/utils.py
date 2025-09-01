@@ -179,18 +179,18 @@ def extract_code_from_text(text: str, code_block_tags: tuple[str, str]) -> str |
 
 
 def parse_code_blobs(text: str, code_block_tags: tuple[str, str]) -> str:
-    """Extract code blocs from the LLM's output.
+    """从LLM的输出中提取代码块。
 
-    If a valid code block is passed, it returns it directly.
+    如果传入一个有效的代码块，则直接返回该代码块。
 
     Args:
-        text (`str`): LLM's output text to parse.
+        text (`str`): 要解析的LLM输出文本。
 
     Returns:
-        `str`: Extracted code block.
+        `str`: 提取的代码块。
 
     Raises:
-        ValueError: If no valid code block is found in the text.
+        ValueError: 如果在文本中找不到有效的代码块。
     """
     matches = extract_code_from_text(text, code_block_tags)
     if not matches:  # Fallback to markdown pattern

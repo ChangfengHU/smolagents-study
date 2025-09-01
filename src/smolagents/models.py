@@ -179,7 +179,7 @@ def agglomerate_stream_deltas(
     stream_deltas: list[ChatMessageStreamDelta], role: MessageRole = MessageRole.ASSISTANT
 ) -> ChatMessage:
     """
-    Agglomerate a list of stream deltas into a single stream delta.
+    # 将流增量列表聚合成单个流增量。
     """
     accumulated_tool_calls: dict[int, ChatMessageToolCallStreamDelta] = {}
     accumulated_content = ""

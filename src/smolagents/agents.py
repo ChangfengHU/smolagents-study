@@ -1710,8 +1710,8 @@ class CodeAgent(MultiStepAgent):
                 )
 
             if not self._use_structured_outputs_internally:
-                # This adds the end code sequence (i.e. the closing code block tag) to the history.
-                # This will nudge subsequent LLM calls to finish with this end code sequence, thus efficiently stopping generation.
+                # 将结束代码序列（即闭合代码块标记）添加到历史记录中。
+                # 这将促使后续的LLM调用以这个结束代码序列结束，从而有效地停止生成。
                 if output_text and not output_text.strip().endswith(self.code_block_tags[1]):
                     output_text += self.code_block_tags[1]
                     memory_step.model_output_message.content = output_text
