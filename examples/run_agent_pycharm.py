@@ -10,9 +10,10 @@ if str(SRC_DIR) not in sys.path:
 
 from dotenv import load_dotenv  # type: ignore
 from smolagents import CodeAgent, OpenAIServerModel, WebSearchTool
+from smolagents.models import ChatMessageStreamDelta
 
 
-PROMPT = "给我一个 3 天东京行程，每天 2 个景点并给出理由"
+PROMPT = "请为我制定一个详细的3天杭州旅行计划。要求：1. 每天安排2个主要景点；2. 为每个景点提供选择理由；3. 包含天气查询和相应的建议；4. 推荐每个区域的特色餐厅；5. 提供交通建议。请使用工具查询相关信息，并生成结构化的行程表。"
 
 
 def main() -> None:
@@ -48,12 +49,23 @@ def main() -> None:
         verbosity_level=1,
         stream_outputs=True,
         planning_interval=3,
-        name="tokyo_trip_agent",
-        description="Generate a 3-day Tokyo itinerary with 2 attractions per day and reasons.",
+        name="hangzhou_trip_agent",
+        description="专业的杭州旅行规划助手，能够制定详细的3天行程安排，包括景点推荐、用餐建议和交通指南。",
+        instructions="""你是一个专业的旅行规划助手。请用中文进行思考和回答。
+
+在解决任务时，请按照以下步骤进行：
+1. 在"思考："部分，用中文解释你的推理过程和要使用的工具
+2. 在代码部分编写Python代码来执行任务
+3. 在"观察："部分，用中文总结代码执行的结果
+4. 最后用中文提供最终答案
+
+请确保所有的思考过程、观察结果和最终答案都使用中文表达。""",
     )
 
     # result = agent.run(PROMPT)
     for step in agent.run(PROMPT, stream=True):
+        if isinstance(step, ChatMessageStreamDelta):
+            continue  # 跳过 ChatMessageStreamDelta 类型的步骤
         print(f"收到步骤: {step}")  # 🔥 最终接收到所有event
     print("\n=== 最终结果 ===\n")
     # print(result)

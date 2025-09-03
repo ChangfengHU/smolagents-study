@@ -14,6 +14,7 @@ from smolagents.monitoring import LogLevel
 from smolagents.memory import ActionStep, PlanningStep, FinalAnswerStep, TaskStep
 from smolagents.tools import Tool
 from dotenv import load_dotenv  # type: ignore
+from smolagents import CodeAgent, OpenAIServerModel, WebSearchTool
 
 import time
 
@@ -261,13 +262,14 @@ def main():
     api_key = os.getenv("OPENAI_API_KEY")
     # 创建模型
     model = OpenAIServerModel(
-        model_id="gpt-4o-mini",
+        model_id="gpt-5-nano",
         api_base="https://api.openai.com/v1",
         api_key=api_key,
     )
 
     # 创建工具
-    tools = create_custom_tools()
+    # tools = create_custom_tools()
+    tools = [WebSearchTool(max_results=10, engine="duckduckgo")]
 
     # 创建回调
     callbacks = create_comprehensive_callbacks()
@@ -296,11 +298,20 @@ def main():
         model=model,
 
         # 提示和指令
-        instructions="你是一个专业的东京旅行规划师。请详细规划行程，包括景点选择理由、交通建议和用餐推荐。",
+        description="专业的杭州旅行规划助手，能够制定详细的3天行程安排，包括景点推荐、用餐建议和交通指南。",
+        instructions="""你是一个专业的旅行规划助手。请用中文进行思考和回答。
+
+        在解决任务时，请按照以下步骤进行：
+        1. 在"思考："部分，用中文解释你的推理过程和要使用的工具
+        2. 在代码部分编写Python代码来执行任务
+        3. 在"观察："部分，用中文总结代码执行的结果
+        4. 最后用中文提供最终答案
+
+        请确保所有的思考过程、观察结果和最终答案都使用中文表达。""",
 
         # 执行控制
-        max_steps=15,  # 增加最大步数以支持更复杂的任务
-        planning_interval=4,  # 每2步进行一次规划
+        max_steps=50,  # 增加最大步数以支持更复杂的任务
+        planning_interval=2,  # 每2步进行一次规划
 
         # 输出控制
         verbosity_level=LogLevel.DEBUG,  # 最详细的日志级别
@@ -309,7 +320,6 @@ def main():
 
         # 代理身份
         name="tokyo_expert_agent",
-        description="专业的东京旅行规划专家，能够提供详细的3天行程安排，包括景点推荐、用餐建议和交通指南。",
         provide_run_summary=True,  # 提供运行摘要
 
         # 回调和验证
@@ -332,7 +342,7 @@ def main():
 
     # 设置额外状态变量（用于测试状态跟踪）
     agent.state.update({
-        "user_preferences": "喜欢历史文化和现代科技",
+        "user_preferences": "喜欢诗词歌赋 才子佳人",
         "budget": "中等预算",
         "travel_style": "深度游",
         "language": "中文"
@@ -343,7 +353,7 @@ def main():
 
     # 复杂任务，能触发多种功能
     complex_task = """
-请为我制定一个详细的3天东京旅行计划。要求：
+请为我制定一个详细的3天杭州旅行计划。要求：
 
 1. 每天安排2个主要景点
 2. 为每个景点提供选择理由

@@ -622,7 +622,6 @@ class MultiStepAgent(ABC):
                 self.memory.steps.append(action_step)
                 yield action_step
                 self.step_number += 1
-
         if not returned_final_answer and self.step_number == max_steps + 1:
             final_answer = self._handle_max_steps_reached(task, images)
             yield action_step
