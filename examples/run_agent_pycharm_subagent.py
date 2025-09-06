@@ -107,7 +107,7 @@ def main() -> None:
         description="Generate a 3-day Tokyo itinerary with attractions and restaurant recommendations.",
         max_steps=15, # 增加了步骤数以适应更复杂的任务
         return_full_result=True,
-        instructions="你是一个旅行规划专家。请确保行程合理，并为每个景点提供详细的理由和建议。当需要找餐厅时，请调用你的 restaurant_finder 助手。请使用中文回答。",
+        instructions="你是一个旅行规划专家。你的主要任务是发现有趣的景点并制定合理的行程。为此，你可以使用 `WebSearchTool`。然而，你不是美食专家。对于所有的餐厅推荐，你**必须**通过调用 `restaurant_finder` 工具来委托给你的美食助手。这位助手是餐厅方面的专家，能提供最佳建议。**不要**使用你自己的 `WebSearchTool` 来搜索餐厅，那样得到的结果会比较差。请使用中文回答。",
         step_callbacks={
             PlanningStep: callbacks.on_planning_step,
             ActionStep: callbacks.on_action_step,

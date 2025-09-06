@@ -262,7 +262,7 @@ def main():
     api_key = os.getenv("OPENAI_API_KEY")
     # 创建模型
     model = OpenAIServerModel(
-        model_id="gpt-5-nano",
+        model_id="gpt-4o-mini",
         api_base="https://api.openai.com/v1",
         api_key=api_key,
     )
@@ -324,7 +324,7 @@ def main():
 
         # 回调和验证
         step_callbacks=callbacks,  # 完整的回调系统
-        final_answer_checks=final_checks,  # 最终答案验证
+        # final_answer_checks=final_checks,  # 最终答案验证
 
         # 代码执行相关
         additional_authorized_imports=[

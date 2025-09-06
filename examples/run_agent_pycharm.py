@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 
 # Make local "src" importable without installing the package (useful for quick local runs / PyCharm)
+#https://platform.openai.com/docs/pricing
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
@@ -19,10 +20,15 @@ PROMPT = "请为我制定一个详细的3天杭州旅行计划。要求：1. 每
 def main() -> None:
     # Load .env if present
     load_dotenv()
-
+     # gpt-5-nano	$0.05
+    #  gpt-4.1-nano	$0.10
+    #gpt-4o-mini	$0.15
     api_key = os.getenv("OPENAI_API_KEY")
     api_base = os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1")
-    model_id = os.getenv("OPENAI_MODEL_ID", "gpt-4o-mini")
+    model_id = os.getenv("OPENAI_MODEL_ID", "gpt-4.1-nano")
+    # model_id = os.getenv("OPENAI_MODEL_ID", "gpt-3.5-turbo")
+    # model_id = os.getenv("OPENAI_MODEL_ID", "gpt-4o-mini")
+    # model_id = os.getenv("OPENAI_MODEL_ID", "gpt-5-nano-2025-08-07")
 
     # If OPENAI_API_KEY is missing, do a friendly dry-run instead of crashing
     if not api_key:

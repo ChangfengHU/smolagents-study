@@ -622,6 +622,7 @@ class MultiStepAgent(ABC):
                 self.memory.steps.append(action_step)
                 yield action_step
                 self.step_number += 1
+
         if not returned_final_answer and self.step_number == max_steps + 1:
             final_answer = self._handle_max_steps_reached(task, images)
             yield action_step
@@ -921,18 +922,18 @@ class MultiStepAgent(ABC):
 
     def save(self, output_dir: str | Path, relative_path: str | None = None):
         """
-        Saves the relevant code files for your agent. This will copy the code of your agent in `output_dir` as well as autogenerate:
+        为您的代理保存相关的代码文件。这将在“ output_dir”中复制您的代理的代码以及自动化：
 
-        - a `tools` folder containing the logic for each of the tools under `tools/{tool_name}.py`.
-        - a `managed_agents` folder containing the logic for each of the managed agents.
-        - an `agent.json` file containing a dictionary representing your agent.
-        - a `prompt.yaml` file containing the prompt templates used by your agent.
-        - an `app.py` file providing a UI for your agent when it is exported to a Space with `agent.push_to_hub()`
-        - a `requirements.txt` containing the names of the modules used by your tool (as detected when inspecting its
-          code)
+         - 一个“工具”文件夹，其中包含``工具/{tool_name} .py''下的每个工具的逻辑。
+         - 一个``takaned_agents`文件夹''，该文件夹包含每个托管代理的逻辑。
+         - 一个包含代表您的代理的字典的'agent.json`文件。
+         - 一个`提示。yaml`文件，其中包含代理使用的提示模板。
+         - 一个`app.py'文件，当您的代理将其导出到使用`egent.push_to_hub（）``
+         - 一个`ruesignt.txt`包含工具使用的模块的名称（如在检查其时检测到的
+          代码）
 
-        Args:
-            output_dir (`str` or `Path`): The folder in which you want to save your agent.
+        args：
+            output_dir（'str`或`路径）：要保存代理的文件夹。
         """
         make_init_file(output_dir)
 
