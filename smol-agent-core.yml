@@ -1,0 +1,262 @@
+app:
+  description: 'Core workflow of smol-agents, replicated in Dify.'
+  icon: '🤖'
+  icon_background: '#FCE7F3'
+  mode: advanced-chat
+  name: SmolAgentCore
+kind: app
+version: 0.1.0
+workflow:
+  conversation_variables:
+    - name: task
+      value: ''
+      value_type: string
+    - name: history
+      value: []
+      value_type: array[object]
+    - name: shouldContinue
+      value: true
+      value_type: boolean
+    - name: max_loops
+      value: 5
+      value_type: number
+    - name: final_answer
+      value: ''
+      value_type: string
+
+  features:
+    opening_statement: "I am a smol-agent running in Dify. What can I help you with?"
+
+  graph:
+    nodes:
+      - id: start
+        data:
+          title: "Start"
+          type: start
+          variables:
+            - variable: task
+              label: "User Task"
+              type: string
+              required: true
+        position:
+          x: 50
+          y: 50
+
+      - id: init_vars
+        data:
+          title: "Initialize Variables"
+          type: assigner
+          items:
+            - variable_selector: ["history"]
+              operation: over-write
+              input_type: static
+              value: []
+            - variable_selector: ["shouldContinue"]
+              operation: over-write
+              input_type: static
+              value: true
+            - variable_selector: ["final_answer"]
+              operation: over-write
+              input_type: static
+              value: ''
+        position:
+          x: 50
+          y: 200
+
+      - id: loop
+        data:
+          title: "Agent Loop"
+          type: iteration
+          iterator_selector: ["init_vars", "max_loops"] # This is a trick to loop N times
+          output_type: array[object]
+        position:
+          x: 50
+          y: 350
+
+      - id: agent_llm
+        parentId: loop
+        data:
+          title: "Agent Thinker"
+          type: llm
+          model:
+            provider: openai
+            name: gpt-4
+            mode: chat
+          prompt_template:
+            - role: system
+              text: |
+                You are an expert assistant who can solve any task using tool calls. You will be given a task to solve as best you can.
+                To do so, you have been given access to some tools.
+                You work in a loop of Action/Observation.
+                
+                Your action is a tool call. After the tool is executed, you will get the result as an "observation".
+                Based on the history of actions and observations, you will decide on the next action.
+                
+                To provide the final answer, use the action "final_answer". This is the only way to complete the task.
+                
+                Available tools:
+                - web_search:
+                    description: "Searches the web for the given query."
+                    arguments:
+                      query: "The search query."
+                
+                You MUST output a JSON object with the following structure:
+                {
+                  "thought": "Your reasoning for the next action.",
+                  "action": {
+                    "name": "tool_name_or_final_answer",
+                    "arguments": {
+                      "arg_name": "arg_value"
+                    }
+                  },
+                  "shouldContinue": boolean
+                }
+                
+                If you are done, set "action.name" to "final_answer" and "shouldContinue" to false.
+          memory:
+            window:
+              enabled: true
+              size: 10
+            query_prompt_template: |
+              Task: {{task}}
+              History:
+              {{#history}}
+              Thought: {{thought}}
+              Action: {{action.name}}({{action.arguments}})
+              Observation: {{observation}}
+              {{/history}}
+        position:
+          x: 100
+          y: 100
+
+      - id: parse_json
+        parentId: loop
+        data:
+          title: "Parse Agent Output"
+          type: tool
+          provider_id: json_process
+          tool_name: parse
+          tool_parameters:
+            content: '{{#agent_llm.text#}}'
+        position:
+          x: 100
+          y: 250
+
+      - id: check_final_answer
+        parentId: loop
+        data:
+          title: "Is it Final Answer?"
+          type: if-else
+          cases:
+            - case_id: "true"
+              conditions:
+                - variable_selector: ["parse_json", "action", "name"]
+                  comparison_operator: "is"
+                  value: "final_answer"
+        position:
+          x: 100
+          y: 400
+
+      - id: set_final_answer
+        parentId: loop
+        data:
+          title: "Set Final Answer"
+          type: assigner
+          items:
+            - variable_selector: ["final_answer"]
+              operation: over-write
+              input_type: variable
+              value: ["parse_json", "action", "arguments", "answer"]
+            - variable_selector: ["shouldContinue"]
+              operation: over-write
+              input_type: static
+              value: false
+        position:
+          x: -100
+          y: 550
+
+      - id: call_tool
+        parentId: loop
+        data:
+          title: "Call Tool"
+          type: if-else
+          cases:
+            - case_id: "web_search"
+              conditions:
+                - variable_selector: ["parse_json", "action", "name"]
+                  comparison_operator: "is"
+                  value: "web_search"
+        position:
+          x: 300
+          y: 550
+
+      - id: web_search_tool
+        parentId: loop
+        data:
+          title: "Web Search"
+          type: tool
+          provider_id: tavily # Assuming tavily is added as a dependency
+          tool_name: tavily_search
+          tool_parameters:
+            query: '{{#parse_json.action.arguments.query#}}'
+        position:
+          x: 300
+          y: 700
+
+      - id: update_history
+        parentId: loop
+        data:
+          title: "Update History"
+          type: assigner
+          items:
+            - variable_selector: ["history"]
+              operation: append
+              input_type: object
+              value:
+                thought: '{{#parse_json.thought#}}'
+                action: '{{#parse_json.action#}}'
+                observation: '{{#web_search_tool.text#}}'
+        position:
+          x: 300
+          y: 850
+
+      - id: answer_node
+        data:
+          title: "Answer"
+          type: answer
+          answer: '{{#final_answer#}}'
+        position:
+          x: 50
+          y: 500
+
+    edges:
+      - source: start
+        target: init_vars
+      - source: init_vars
+        target: loop
+      - source: loop
+        target: answer_node
+      - source: 1739244888446start # Special ID for iteration start
+        target: agent_llm
+        parentId: loop
+      - source: agent_llm
+        target: parse_json
+        parentId: loop
+      - source: parse_json
+        target: check_final_answer
+        parentId: loop
+      - source: check_final_answer
+        target: set_final_answer
+        sourceHandle: "true"
+        parentId: loop
+      - source: check_final_answer
+        target: call_tool
+        sourceHandle: "false"
+        parentId: loop
+      - source: call_tool
+        target: web_search_tool
+        sourceHandle: "web_search"
+        parentId: loop
+      - source: web_search_tool
+        target: update_history
+        parentId: loop

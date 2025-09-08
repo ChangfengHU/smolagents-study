@@ -1,0 +1,15 @@
+# 你的隧道 ID 和凭证文件路径
+tunnel: eyJhIjoiMDU5ZmViMDQ3MzQ4ZTE1M2I2NWY1ZWZkZTYzOGFjZjQiLCJ0IjoiOTQ0NjZmMTEtN2YzNS00MDNkLThmYjYtZmFkZWIwNGViNzgzIiwicyI6IlltWm1NbUZpTmpndFpqZ3dZeTAwTXpKbUxUaGlOV010WldVMU1HVXhZVFZpWW1VMSJ9
+credentials-file: /home/nonroot/.cloudflared/eyJhIjoiMDU5ZmViMDQ3MzQ4ZTE1M2I2NWY1ZWZkZTYzOGFjZjQiLCJ0IjoiOTQ0NjZmMTEtN2YzNS00MDNkLThmYjYtZmFkZWIwNGViNzgzIiwicyI6IlltWm1NbUZpTmpndFpqZ3dZeTAwTXpKbUxUaGlOV010WldVMU1HVXhZVFZpWW1VMSJ9.json
+
+ingress:
+  # --- 你现有的 HTTP 服务规则 ---
+  - hostname: faker.vyibc.com # 假设这是你的HTTP服务域名
+    service: http://192.168.10.106:81 # 你的HTTP服务地址
+
+  # --- 你新增的 SSH 服务规则 ---
+  - hostname: mac.vyibc.com
+    service: ssh://192.168.10.110:22
+
+  # --- 最后的收尾规则 ---
+  - service: http_status:404
