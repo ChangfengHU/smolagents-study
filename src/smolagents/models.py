@@ -191,28 +191,32 @@ def agglomerate_stream_deltas(
             total_output_tokens += stream_delta.token_usage.output_tokens
         if stream_delta.content:
             accumulated_content += stream_delta.content
+        # 遍历流数据中的工具调用列表
         if stream_delta.tool_calls:
-            for tool_call_delta in stream_delta.tool_calls:  # ?ormally there should be only one call at a time
-                # Extend accumulated_tool_calls list to accommodate the new tool call if needed
+            for tool_call_delta in stream_delta.tool_calls:  # 通常情况下一次只会有一个工具调用
+                # 如果需要，扩展累积工具调用列表以容纳新的工具调用
                 if tool_call_delta.index is not None:
+                    # 如果工具调用的索引不在累积工具调用列表中，则添加新的工具调用
                     if tool_call_delta.index not in accumulated_tool_calls:
                         accumulated_tool_calls[tool_call_delta.index] = ChatMessageToolCallStreamDelta(
                             id=tool_call_delta.id,
                             type=tool_call_delta.type,
                             function=ChatMessageToolCallFunction(name="", arguments=""),
                         )
-                    # Update the tool call at the specific index
+                    # 更新特定索引处的工具调用
                     tool_call = accumulated_tool_calls[tool_call_delta.index]
                     if tool_call_delta.id:
                         tool_call.id = tool_call_delta.id
                     if tool_call_delta.type:
                         tool_call.type = tool_call_delta.type
                     if tool_call_delta.function:
+                        # 更新工具调用的函数信息
                         if tool_call_delta.function.name and len(tool_call_delta.function.name) > 0:
                             tool_call.function.name = tool_call_delta.function.name
                         if tool_call_delta.function.arguments:
                             tool_call.function.arguments += tool_call_delta.function.arguments
                 else:
+                    # 如果工具调用没有提供索引，则抛出数值错误异常
                     raise ValueError(f"Tool call index is not provided in tool delta: {tool_call_delta}")
 
     return ChatMessage(

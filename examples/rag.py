@@ -15,11 +15,11 @@ source_docs = [
 ]
 
 text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=500,
-    chunk_overlap=50,
-    add_start_index=True,
-    strip_whitespace=True,
-    separators=["\n\n", "\n", ".", " ", ""],
+    chunk_size=500,  # 分块大小为500
+    chunk_overlap=50,  # 分块重叠为50
+    add_start_index=True,  # 添加起始索引
+    strip_whitespace=True,  # 去除空白字符
+    separators=["\n\n", "\n", ".", " ", ""],  # 分隔符为"\n\n", "\n", ".", " ", ""
 )
 docs_processed = text_splitter.split_documents(source_docs)
 
