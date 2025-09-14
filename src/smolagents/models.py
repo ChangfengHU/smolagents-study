@@ -380,7 +380,49 @@ def supports_stop_parameter(model_id: str) -> bool:
     return not re.match(pattern, model_name)
 
 
+class _ParameterRemove:
+    """Sentinel value to indicate a parameter should be removed."""
+
+    def __repr__(self):
+        return "REMOVE_PARAMETER"
+
+
+# Singleton instance for removing parameters
+REMOVE_PARAMETER = _ParameterRemove()
+
+
 class Model:
+    """Base class for all language model implementations.
+
+    This abstract class defines the core interface that all model implementations must follow
+    to work with agents. It provides common functionality for message handling, tool integration,
+    and model configuration while allowing subclasses to implement their specific generation logic.
+
+    Parameters:
+        flatten_messages_as_text (`bool`, default `False`):
+            Whether to flatten complex message content into plain text format.
+        tool_name_key (`str`, default `"name"`):
+            The key used to extract tool names from model responses.
+        tool_arguments_key (`str`, default `"arguments"`):
+            The key used to extract tool arguments from model responses.
+        model_id (`str`, *optional*):
+            Identifier for the specific model being used.
+        **kwargs:
+            Additional keyword arguments to forward to the underlying model completion call.
+
+    Note:
+        This is an abstract base class. Subclasses must implement the `generate()` method
+        to provide actual model inference capabilities.
+
+    Example:
+        ```python
+        class CustomModel(Model):
+            def generate(self, messages, **kwargs):
+                # Implementation specific to your model
+                pass
+        ```
+    """
+
     def __init__(
         self,
         flatten_messages_as_text: bool = False,
@@ -407,12 +449,12 @@ class Model:
         **kwargs,
     ) -> dict[str, Any]:
         """
-        Prepare parameters required for model invocation, handling parameter priorities.
+        Prepare parameters required for model invocation.
 
-        Parameter priority from high to low:
-        1. Explicitly passed kwargs
-        2. Specific parameters (stop_sequences, response_format, etc.)
-        3. Default values in self.kwargs
+        Parameter priority (highest to lowest):
+        1. self.kwargs (model defaults)
+        2. Explicitly passed kwargs
+        3. Specific parameters (stop_sequences, response_format, etc.)
         """
         # Clean and standardize the message list
         flatten_messages_as_text = kwargs.pop("flatten_messages_as_text", self.flatten_messages_as_text)
@@ -422,32 +464,28 @@ class Model:
             convert_images_to_image_urls=convert_images_to_image_urls,
             flatten_messages_as_text=flatten_messages_as_text,
         )
-        # Use self.kwargs as the base configuration
+        # Start with messages
         completion_kwargs = {
-            **self.kwargs,
             "messages": messages_as_dicts,
         }
-
-        # Handle specific parameters
-        if stop_sequences is not None:
+        # Override with specific parameters
+        if stop_sequences is not None and supports_stop_parameter(self.model_id or ""):
             # Some models do not support stop parameter
-            if supports_stop_parameter(self.model_id or ""):
-                completion_kwargs["stop"] = stop_sequences
+            completion_kwargs["stop"] = stop_sequences
         if response_format is not None:
             completion_kwargs["response_format"] = response_format
-
-        # Handle tools parameter
         if tools_to_call_from:
-            tools_config = {
-                "tools": [get_tool_json_schema(tool) for tool in tools_to_call_from],
-            }
+            completion_kwargs["tools"] = [get_tool_json_schema(tool) for tool in tools_to_call_from]
             if tool_choice is not None:
-                tools_config["tool_choice"] = tool_choice
-            completion_kwargs.update(tools_config)
-
-        # Finally, use the passed-in kwargs to override all settings
+                completion_kwargs["tool_choice"] = tool_choice
+        # Override with passed-in kwargs
         completion_kwargs.update(kwargs)
-
+        # Override with self.kwargs
+        for kwarg_name, kwarg_value in self.kwargs.items():
+            if kwarg_value is REMOVE_PARAMETER:
+                completion_kwargs.pop(kwarg_name, None)  # Remove parameter if present
+            else:
+                completion_kwargs[kwarg_name] = kwarg_value  # Set/override parameter
         return completion_kwargs
 
     def generate(
@@ -538,7 +576,9 @@ class VLLMModel(Model):
             The Hugging Face model ID to be used for inference.
             This can be a path or model identifier from the Hugging Face model hub.
         model_kwargs (`dict[str, Any]`, *optional*):
-            Additional keyword arguments to pass to the vLLM model (like revision, max_model_len, etc.).
+            Additional keyword arguments to forward to the vLLM LLM instantiation, such as `revision`, `max_model_len`, etc.
+        **kwargs:
+            Additional keyword arguments to forward to the underlying vLLM model generate call.
     """
 
     def __init__(
@@ -621,6 +661,7 @@ class VLLMModel(Model):
             prompt,
             sampling_params=sampling_params,
             guided_options_request=guided_options_request,
+            **completion_kwargs,
         )
 
         output_text = out[0].outputs[0].text
@@ -639,7 +680,7 @@ class MLXModel(Model):
     """A class to interact with models loaded using MLX on Apple silicon.
 
     > [!TIP]
-    > You must have `mlx-lm` installed on your machine. Please run `pip install smolagents[mlx-lm]` if it's not the case.
+    > You must have `mlx-lm` installed on your machine. Please run `pip install 'smolagents[mlx-lm]'` if it's not the case.
 
     Parameters:
         model_id (str):
@@ -654,8 +695,8 @@ class MLXModel(Model):
             Additional keyword arguments to pass to the `mlx.lm.load` method when loading the model and tokenizer.
         apply_chat_template_kwargs (dict, *optional*):
             Additional keyword arguments to pass to the `apply_chat_template` method of the tokenizer.
-        kwargs (dict, *optional*):
-            Any additional keyword arguments that you want to use in model.generate(), for instance `max_tokens`.
+        **kwargs:
+            Additional keyword arguments to forward to the underlying MLX model stream_generate call, for instance `max_tokens`.
 
     Example:
     ```python
@@ -748,7 +789,7 @@ class TransformersModel(Model):
     This model allows you to load and use Hugging Face's models locally using the Transformers library. It supports features like stop sequences and grammar customization.
 
     > [!TIP]
-    > You must have `transformers` and `torch` installed on your machine. Please run `pip install smolagents[transformers]` if it's not the case.
+    > You must have `transformers` and `torch` installed on your machine. Please run `pip install 'smolagents[transformers]'` if it's not the case.
 
     Parameters:
         model_id (`str`):
@@ -762,8 +803,12 @@ class TransformersModel(Model):
             Some models on the Hub require running remote code: for this model, you would have to set this flag to True.
         model_kwargs (`dict[str, Any]`, *optional*):
             Additional keyword arguments to pass to `AutoModel.from_pretrained` (like revision, model_args, config, etc.).
+        max_new_tokens (`int`, default `4096`):
+            Maximum number of new tokens to generate, ignoring the number of tokens in the prompt.
+        max_tokens (`int`, *optional*):
+            Alias for `max_new_tokens`. If provided, this value takes precedence.
         **kwargs:
-            Additional keyword arguments to pass to `model.generate()`, for instance `max_new_tokens` or `device`.
+            Additional keyword arguments to forward to the underlying Transformers model generate call, such as `device`.
     Raises:
         ValueError:
             If the model name is not provided.
@@ -789,6 +834,8 @@ class TransformersModel(Model):
         torch_dtype: str | None = None,
         trust_remote_code: bool = False,
         model_kwargs: dict[str, Any] | None = None,
+        max_new_tokens: int = 4096,
+        max_tokens: int | None = None,
         **kwargs,
     ):
         try:
@@ -814,13 +861,7 @@ class TransformersModel(Model):
             )
             model_id = "HuggingFaceTB/SmolLM2-1.7B-Instruct"
 
-        default_max_tokens = 4096
-        max_new_tokens = kwargs.get("max_new_tokens") or kwargs.get("max_tokens")
-        if not max_new_tokens:
-            kwargs["max_new_tokens"] = default_max_tokens
-            warnings.warn(
-                f"`max_new_tokens` not provided, using this default value for `max_new_tokens`: {default_max_tokens}"
-            )
+        max_new_tokens = max_tokens if max_tokens is not None else max_new_tokens
 
         if device_map is None:
             device_map = "cuda" if torch.cuda.is_available() else "cpu"
@@ -854,7 +895,9 @@ class TransformersModel(Model):
                 raise e
         except Exception as e:
             raise ValueError(f"Failed to load tokenizer and model for {model_id=}: {e}") from e
-        super().__init__(flatten_messages_as_text=not self._is_vlm, model_id=model_id, **kwargs)
+        super().__init__(
+            flatten_messages_as_text=not self._is_vlm, model_id=model_id, max_new_tokens=max_new_tokens, **kwargs
+        )
 
     def make_stopping_criteria(self, stop_sequences: list[str], tokenizer) -> "StoppingCriteriaList":
         from transformers import StoppingCriteria, StoppingCriteriaList
@@ -1028,7 +1071,8 @@ class ApiModel(Model):
             Pre-configured API client instance. If not provided, a default client will be created. Defaults to None.
         requests_per_minute (`float`, **optional**):
             Rate limit in requests per minute.
-        **kwargs: Additional keyword arguments to pass to the parent class.
+        **kwargs:
+            Additional keyword arguments to forward to the underlying model completion call.
     """
 
     def __init__(
@@ -1069,7 +1113,7 @@ class LiteLLMModel(ApiModel):
         flatten_messages_as_text (`bool`, *optional*): Whether to flatten messages as text.
             Defaults to `True` for models that start with "ollama", "groq", "cerebras".
         **kwargs:
-            Additional keyword arguments to pass to the OpenAI API.
+            Additional keyword arguments to forward to the underlying LiteLLM completion call.
     """
 
     def __init__(
@@ -1136,6 +1180,12 @@ class LiteLLMModel(ApiModel):
         )
         self._apply_rate_limit()
         response = self.client.completion(**completion_kwargs)
+        if not response.choices:
+            raise RuntimeError(
+                f"Unexpected API response: model '{self.model_id}' returned no choices. "
+                " This may indicate a possible API or upstream issue. "
+                f"Response details: {response.model_dump()}"
+            )
         return ChatMessage.from_dict(
             response.choices[0].message.model_dump(include={"role", "content", "tool_calls"}),
             raw=response,
@@ -1220,7 +1270,7 @@ class LiteLLMRouterModel(LiteLLMModel):
         flatten_messages_as_text (`bool`, *optional*): Whether to flatten messages as text.
             Defaults to `True` for models that start with "ollama", "groq", "cerebras".
         **kwargs:
-            Additional keyword arguments to pass to the LiteLLM Router completion method.
+            Additional keyword arguments to forward to the underlying LiteLLM Router completion call.
 
     Example:
     ```python
@@ -1327,7 +1377,7 @@ class InferenceClientModel(ApiModel):
             Base URL to run inference. This is a duplicated argument from `model` to make [`InferenceClientModel`]
             follow the same pattern as `openai.OpenAI` client. Cannot be used if `model` is set. Defaults to None.
         **kwargs:
-            Additional keyword arguments to pass to the Hugging Face InferenceClient.
+            Additional keyword arguments to forward to the underlying Hugging Face InferenceClient completion call.
 
     Raises:
         ValueError:
@@ -1494,7 +1544,7 @@ class OpenAIServerModel(ApiModel):
         flatten_messages_as_text (`bool`, default `False`):
             Whether to flatten messages as text.
         **kwargs:
-            Additional keyword arguments to pass to the OpenAI API.
+            Additional keyword arguments to forward to the underlying OpenAI API completion call, for instance `temperature`.
     """
 
     def __init__(
@@ -1654,7 +1704,7 @@ class AzureOpenAIServerModel(OpenAIServerModel):
             Custom role conversion mapping to convert message roles in others.
             Useful for specific models that do not support specific message roles like "system".
         **kwargs:
-            Additional keyword arguments to pass to the Azure OpenAI API.
+            Additional keyword arguments to forward to the underlying Azure OpenAI API completion call.
     """
 
     def __init__(
@@ -1730,8 +1780,8 @@ class AmazonBedrockServerModel(ApiModel):
             Defaults to converting all roles to "user" role to enable using all the Bedrock models.
         flatten_messages_as_text (`bool`, default `False`):
             Whether to flatten messages as text.
-        **kwargs
-            Additional keyword arguments passed directly to the underlying API calls.
+        **kwargs:
+            Additional keyword arguments to forward to the underlying Amazon Bedrock model converse call.
 
     Examples:
         Creating a model instance with default settings:
@@ -1878,14 +1928,14 @@ class AmazonBedrockServerModel(ApiModel):
         # self.client is created in ApiModel class
         response = self.client.converse(**completion_kwargs)
 
-        # Get last message content block in case thinking mode is enabled: discard thinking
-        last_message_content_block = response["output"]["message"]["content"][-1]
-        if "text" not in last_message_content_block:
-            raise KeyError(
-                '"text" field not found in the last element of response["output"]["message"]["content"]. '
-                "Unexpected output format, possibly due to thinking mode changes."
-            )
-        response["output"]["message"]["content"] = last_message_content_block["text"]
+        # Get content blocks with "text" key: in case thinking blocks are present, discard them
+        message_content_blocks_with_text = [
+            block for block in response["output"]["message"]["content"] if "text" in block
+        ]
+        if not message_content_blocks_with_text:
+            raise KeyError("No message content blocks with 'text' key found in response")
+        # Keep the last one
+        response["output"]["message"]["content"] = message_content_blocks_with_text[-1]["text"]
         return ChatMessage.from_dict(
             response["output"]["message"],
             raw=response,
@@ -1899,6 +1949,7 @@ class AmazonBedrockServerModel(ApiModel):
 AmazonBedrockModel = AmazonBedrockServerModel
 
 __all__ = [
+    "REMOVE_PARAMETER",
     "MessageRole",
     "tool_role_conversions",
     "get_clean_message_list",

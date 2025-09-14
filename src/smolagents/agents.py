@@ -76,7 +76,7 @@ from .monitoring import (
     LogLevel,
     Monitor,
 )
-from .remote_executors import DockerExecutor, E2BExecutor, WasmExecutor
+from .remote_executors import DockerExecutor, E2BExecutor, ModalExecutor, WasmExecutor
 from .tools import BaseTool, Tool, validate_tool_arguments
 from .utils import (
     AgentError,
@@ -102,16 +102,14 @@ def get_variable_names(self, template: str) -> set[str]:
     pattern = re.compile(r"\{\{([^{}]+)\}\}")
     return {match.group(1).strip() for match in pattern.finditer(template)}
 
+
 def populate_template(template: str, variables: dict[str, Any]) -> str:
-    # 使用 jinja2 模板引擎，创建模板对象 compiled_template
-    # 设置 undefined=StrictUndefined，确保在模板中使用未定义的变量时会抛出异常
     compiled_template = Template(template, undefined=StrictUndefined)
     try:
-        # 使用传入的 variables 字典渲染模板，并返回渲染后的结果
         return compiled_template.render(**variables)
     except Exception as e:
-        # 捕获任何渲染过程中的异常，并抛出包含详细错误信息的新异常
         raise Exception(f"Error during jinja template rendering: {type(e).__name__}: {e}")
+
 
 @dataclass
 class ActionOutput:
@@ -273,33 +271,33 @@ StreamEvent: TypeAlias = Union[
 
 class MultiStepAgent(ABC):
     """
-    逐步解决给定任务的代理类，使用 ReAct 框架：
-    在未达到目标之前，代理将执行一次动作循环（由 LLM 给出）和观察（从环境中获得）。
+    Agent class that solves the given task step by step, using the ReAct framework:
+    While the objective is not reached, the agent will perform a cycle of action (given by the LLM) and observation (obtained from the environment).
 
     Args:
-        tools (`list[Tool]`): 代理可以使用的工具。
-        model (`Callable[[list[dict[str, str]]], ChatMessage`): 将生成代理动作的模型。
-        prompt_templates ([`~agents.PromptTemplates`], *optional*): 提示模板。
-        instructions (`str`, *optional*): 代理的自定义指令，将插入系统提示中。
-        max_steps (`int`, default `20`): 代理解决任务时可以采取的最大步数。
-        add_base_tools (`bool`, default `False`): 是否将基本工具添加到代理的工具中。
-        verbosity_level (`LogLevel`, default `LogLevel.INFO`): 代理日志的详细级别。
-        managed_agents (`list`, *optional*): 代理可以调用的托管代理。
-        step_callbacks (`list[Callable]` | `dict[Type[MemoryStep], Callable | list[Callable]]`, *optional*): 每个步骤将调用的回调函数。
-        planning_interval (`int`, *optional*): 代理将运行规划步骤的间隔。
-        name (`str`, *optional*): 仅对托管代理必需 - 可以通过此名称调用代理。
-        description (`str`, *optional*): 仅对托管代理必需 - 此代理的描述。
-        provide_run_summary (`bool`, *optional*): 在作为托管代理调用时是否提供运行摘要。
-        final_answer_checks (`list[Callable]`, *optional*): 运行接受最终答案之前运行的验证函数列表。
-            每个函数应：
-            - 接受最终答案和代理的记忆作为参数。
-            - 返回指示最终答案是否有效的布尔值。
-        return_full_result (`bool`, default `False`): 是否返回完整的 [`RunResult`] 对象或仅从代理运行中返回最终答案输出。
+        tools (`list[Tool]`): [`Tool`]s that the agent can use.
+        model (`Callable[[list[dict[str, str]]], ChatMessage]`): Model that will generate the agent's actions.
+        prompt_templates ([`~agents.PromptTemplates`], *optional*): Prompt templates.
+        instructions (`str`, *optional*): Custom instructions for the agent, will be inserted in the system prompt.
+        max_steps (`int`, default `20`): Maximum number of steps the agent can take to solve the task.
+        add_base_tools (`bool`, default `False`): Whether to add the base tools to the agent's tools.
+        verbosity_level (`LogLevel`, default `LogLevel.INFO`): Level of verbosity of the agent's logs.
+        managed_agents (`list`, *optional*): Managed agents that the agent can call.
+        step_callbacks (`list[Callable]` | `dict[Type[MemoryStep], Callable | list[Callable]]`, *optional*): Callbacks that will be called at each step.
+        planning_interval (`int`, *optional*): Interval at which the agent will run a planning step.
+        name (`str`, *optional*): Necessary for a managed agent only - the name by which this agent can be called.
+        description (`str`, *optional*): Necessary for a managed agent only - the description of this agent.
+        provide_run_summary (`bool`, *optional*): Whether to provide a run summary when called as a managed agent.
+        final_answer_checks (`list[Callable]`, *optional*): List of validation functions to run before accepting a final answer.
+            Each function should:
+            - Take the final answer and the agent's memory as arguments.
+            - Return a boolean indicating whether the final answer is valid.
+        return_full_result (`bool`, default `False`): Whether to return the full [`RunResult`] object or just the final answer output from the agent run.
     """
 
     def __init__(
         self,
-        tools: list[Tool],  # 初始化方法的参数，包括工具列表、模型、提示模板等
+        tools: list[Tool],
         model: Model,
         prompt_templates: PromptTemplates | None = None,
         instructions: str | None = None,
@@ -316,46 +314,47 @@ class MultiStepAgent(ABC):
         return_full_result: bool = False,
         logger: AgentLogger | None = None,
     ):
-        self.agent_name = self.__class__.__name__  # 获取当前类的名称
-        self.model = model  # 初始化模型
-        self.prompt_templates = prompt_templates or EMPTY_PROMPT_TEMPLATES  # 如果未提供提示模板，则使用默认空模板
-        if prompt_templates is not None:  # 如果提供了自定义提示模板
-            missing_keys = set(EMPTY_PROMPT_TEMPLATES.keys()) - set(prompt_templates.keys())  # 检查是否有缺失的提示模板键
+        self.agent_name = self.__class__.__name__
+        self.model = model
+        self.prompt_templates = prompt_templates or EMPTY_PROMPT_TEMPLATES
+        if prompt_templates is not None:
+            missing_keys = set(EMPTY_PROMPT_TEMPLATES.keys()) - set(prompt_templates.keys())
             assert not missing_keys, (
                 f"Some prompt templates are missing from your custom `prompt_templates`: {missing_keys}"
             )
-            for key, value in EMPTY_PROMPT_TEMPLATES.items():  # 遍历默认空模板
-                if isinstance(value, dict):  # 如果值是字典
-                    for subkey in value.keys():  # 遍历子键
+            for key, value in EMPTY_PROMPT_TEMPLATES.items():
+                if isinstance(value, dict):
+                    for subkey in value.keys():
                         assert key in prompt_templates.keys() and (subkey in prompt_templates[key].keys()), (
                             f"Some prompt templates are missing from your custom `prompt_templates`: {subkey} under {key}"
                         )
 
-        self.max_steps = max_steps  # 初始化最大步数
-        self.step_number = 0  # 步数初始化为0
-        self.planning_interval = planning_interval  # 初始化规划间隔
-        self.state: dict[str, Any] = {}  # 初始化状态字典
-        self.name = self._validate_name(name)  # 使用私有方法验证名称
-        self.description = description  # 初始化描述
-        self.provide_run_summary = provide_run_summary  # 是否提供运行摘要
-        self.final_answer_checks = final_answer_checks if final_answer_checks is not None else []  # 初始化最终答案检查列表
-        self.return_full_result = return_full_result  # 是否返回完整结果
-        self.instructions = instructions  # 初始化指令
-        self._setup_managed_agents(managed_agents)  # 设置托管代理
-        self._setup_tools(tools, add_base_tools)  # 设置工具
-        self._validate_tools_and_managed_agents(tools, managed_agents)  # 验证工具和托管代理
+        self.max_steps = max_steps
+        self.step_number = 0
+        self.planning_interval = planning_interval
+        self.state: dict[str, Any] = {}
+        self.name = self._validate_name(name)
+        self.description = description
+        self.provide_run_summary = provide_run_summary
+        self.final_answer_checks = final_answer_checks if final_answer_checks is not None else []
+        self.return_full_result = return_full_result
+        self.instructions = instructions
+        self._setup_managed_agents(managed_agents)
+        self._setup_tools(tools, add_base_tools)
+        self._validate_tools_and_managed_agents(tools, managed_agents)
 
-        self.task: str | None = None  # 任务初始化为空
-        self.memory = AgentMemory(self.system_prompt)  # 初始化代理记忆
+        self.task: str | None = None
+        self.memory = AgentMemory(self.system_prompt)
 
-        if logger is None:  # 如果未提供日志记录器
-            self.logger = AgentLogger(level=verbosity_level)  # 创建代理日志记录器
+        if logger is None:
+            self.logger = AgentLogger(level=verbosity_level)
         else:
-            self.logger = logger  # 使用提供的日志记录器
+            self.logger = logger
 
-        self.monitor = Monitor(self.model, self.logger)  # 初始化监视器
-        self._setup_step_callbacks(step_callbacks)  # 设置步回调
-        self.stream_outputs = False  # 输出流初始化为False
+        self.monitor = Monitor(self.model, self.logger)
+        self._setup_step_callbacks(step_callbacks)
+        self.stream_outputs = False
+
     @property
     def system_prompt(self) -> str:
         return self.initialize_system_prompt()
@@ -417,16 +416,15 @@ class MultiStepAgent(ABC):
                 f"{[name for name in tool_and_managed_agent_names if tool_and_managed_agent_names.count(name) > 1]}"
             )
 
-
     def _setup_step_callbacks(self, step_callbacks):
-        # 初始化步骤回调注册表
+        # Initialize step callbacks registry
         self.step_callbacks = CallbackRegistry()
         if step_callbacks:
-            # 为了向后兼容，仅为ActionStep注册回调列表
+            # Register callbacks list only for ActionStep for backward compatibility
             if isinstance(step_callbacks, list):
                 for callback in step_callbacks:
                     self.step_callbacks.register(ActionStep, callback)
-            # 为特定步骤类注册回调字典
+            # Register callbacks dict for specific step classes
             elif isinstance(step_callbacks, dict):
                 for step_cls, callbacks in step_callbacks.items():
                     if not isinstance(callbacks, list):
@@ -435,8 +433,9 @@ class MultiStepAgent(ABC):
                         self.step_callbacks.register(step_cls, callback)
             else:
                 raise ValueError("step_callbacks must be a list or a dict")
-        # 为了向后兼容，仅为ActionStep注册监视器更新指标的回调
+        # Register monitor update_metrics only for ActionStep for backward compatibility
         self.step_callbacks.register(ActionStep, self.monitor.update_metrics)
+
     def run(
         self,
         task: str,
@@ -448,39 +447,38 @@ class MultiStepAgent(ABC):
         return_full_result: bool | None = None,
     ) -> Any | RunResult:
         """
-        运行代理以执行给定任务。
+        Run the agent for the given task.
 
         Args:
-            task (`str`): 要执行的任务。
-            stream (`bool`): 是否以流模式运行。
-                如果为 `True`，则返回一个生成器，逐步返回每个步骤的执行结果。您必须迭代此生成器以处理各个步骤（例如，使用 for 循环或 `next()`）。
-                如果为 `False`，则在内部执行所有步骤，并仅在完成后返回最终答案。
-            reset (`bool`): 是否重置对话或继续上次运行的对话。
-            images (`list[PIL.Image.Image]`, *optional*): 图像对象。
-            additional_args (`dict`, *optional*): 您想要传递给代理运行的任何其他变量，例如图像或数据框。请使用清晰的名称！
-            max_steps (`int`, *optional*): 代理可用于解决任务的最大步数。如果未提供，则使用代理的默认值。
-            return_full_result (`bool`, *optional*): 是否返回完整的 [`RunResult`] 对象或仅返回最终答案输出。
-                如果为 `None`（默认值），则使用代理的 `self.return_full_result` 设置。
+            task (`str`): Task to perform.
+            stream (`bool`): Whether to run in streaming mode.
+                If `True`, returns a generator that yields each step as it is executed. You must iterate over this generator to process the individual steps (e.g., using a for loop or `next()`).
+                If `False`, executes all steps internally and returns only the final answer after completion.
+            reset (`bool`): Whether to reset the conversation or keep it going from previous run.
+            images (`list[PIL.Image.Image]`, *optional*): Image(s) objects.
+            additional_args (`dict`, *optional*): Any other variables that you want to pass to the agent run, for instance images or dataframes. Give them clear names!
+            max_steps (`int`, *optional*): Maximum number of steps the agent can take to solve the task. if not provided, will use the agent's default value.
+            return_full_result (`bool`, *optional*): Whether to return the full [`RunResult`] object or just the final answer output.
+                If `None` (default), the agent's `self.return_full_result` setting is used.
 
         Example:
-                from smolagents import CodeAgent
+        ```py
+        from smolagents import CodeAgent
         agent = CodeAgent(tools=[])
         agent.run("What is the result of 2 power 3.7384?")
-                """
-        # 如果未提供最大步数，则使用默认最大步数
+        ```
+        """
         max_steps = max_steps or self.max_steps
         self.task = task
         self.interrupt_switch = False
         if additional_args:
-            # 更新状态以包含额外参数
             self.state.update(additional_args)
             self.task += f"""
-您已提供这些额外参数，您可以直接使用键作为变量进行访问：
+You have been provided with these additional arguments, that you can access directly using the keys as variables:
 {str(additional_args)}."""
 
         self.memory.system_prompt = SystemPromptStep(system_prompt=self.system_prompt)
         if reset:
-            # 重置内存和监视器
             self.memory.reset()
             self.monitor.reset()
 
@@ -493,60 +491,45 @@ class MultiStepAgent(ABC):
         self.memory.steps.append(TaskStep(task=self.task, task_images=images))
 
         if getattr(self, "python_executor", None):
-            # 发送变量和工具到 Python 执行器
             self.python_executor.send_variables(variables=self.state)
             self.python_executor.send_tools({**self.tools, **self.managed_agents})
 
         if stream:
-            # 以生成器形式返回逐步执行的步骤
+            # The steps are returned as they are executed through a generator to iterate on.
             return self._run_stream(task=self.task, max_steps=max_steps, images=images)
+
         run_start_time = time.time()
-        # 仅在最后返回输出。只查看最后一步。
-
-        # 通过调用 self._run_stream 方法执行任务，获取步骤列表，并转换为列表类型
         steps = list(self._run_stream(task=self.task, max_steps=max_steps, images=images))
-        # 断言 steps 列表中最后一个元素的类型为 FinalAnswerStep 类型，确保最后一个步骤是 FinalAnswerStep 类型
-        assert isinstance(steps[-1], FinalAnswerStep)
-        # 获取最后一个步骤的输出作为结果
-        output = steps[-1].output
-        # 如果 return_full_result 为 None，则使用 self.return_full_result 的值
-        return_full_result = return_full_result if return_full_result is not None else self.return_full_result
 
-        # 如果 return_full_result 为 True，则执行以下逻辑
+        # Outputs are returned only at the end. We only look at the last step.
+        assert isinstance(steps[-1], FinalAnswerStep)
+        output = steps[-1].output
+
+        return_full_result = return_full_result if return_full_result is not None else self.return_full_result
         if return_full_result:
             total_input_tokens = 0
             total_output_tokens = 0
             correct_token_usage = True
-
-            # 遍历 self.memory.steps 中的每一个 step
             for step in self.memory.steps:
-                # 如果 step 是 ActionStep 或 PlanningStep 类型
                 if isinstance(step, (ActionStep, PlanningStep)):
-                    # 检查 token_usage 是否为 None
                     if step.token_usage is None:
                         correct_token_usage = False
                         break
                     else:
-                        # 累加输入和输出 token 数量
                         total_input_tokens += step.token_usage.input_tokens
                         total_output_tokens += step.token_usage.output_tokens
-
-            # 如果所有 step 的 token_usage 都不为 None，则创建 TokenUsage 对象，否则为 None
             if correct_token_usage:
                 token_usage = TokenUsage(input_tokens=total_input_tokens, output_tokens=total_output_tokens)
             else:
                 token_usage = None
 
-            # 如果 self.memory.steps 不为空且最后一个 step 的 error 类型为 AgentMaxStepsError，则状态为 "max_steps_error"，否则为 "success"
             if self.memory.steps and isinstance(getattr(self.memory.steps[-1], "error", None), AgentMaxStepsError):
                 state = "max_steps_error"
             else:
                 state = "success"
 
-            # 获取 self.memory 中所有步骤的详细信息
             step_dicts = self.memory.get_full_steps()
 
-            # 返回 RunResult 对象，包括 output、token_usage、steps、timing 和 state
             return RunResult(
                 output=output,
                 token_usage=token_usage,
@@ -555,45 +538,45 @@ class MultiStepAgent(ABC):
                 state=state,
             )
 
-        # 如果 return_full_result 为 False，则返回 output
         return output
+
     def _run_stream(
         self, task: str, max_steps: int, images: list["PIL.Image.Image"] | None = None
     ) -> Generator[ActionStep | PlanningStep | FinalAnswerStep | ChatMessageStreamDelta]:
-        self.step_number = 1  # 初始化步骤编号为1
-        returned_final_answer = False  # 初始化返回最终答案为False
-        while not returned_final_answer and self.step_number <= max_steps:  # 当未返回最终答案且步骤编号小于等于最大步骤数时执行循环
-            if self.interrupt_switch:  # 如果中断开关为True
-                raise AgentError("Agent interrupted.", self.logger)  # 抛出代理错误，提示代理被中断
+        self.step_number = 1
+        returned_final_answer = False
+        while not returned_final_answer and self.step_number <= max_steps:
+            if self.interrupt_switch:
+                raise AgentError("Agent interrupted.", self.logger)
 
-            # 如果计划间隔不为None且当前步骤为第一步或者当前步骤减去1能整除计划间隔时执行计划步骤
+            # Run a planning step if scheduled
             if self.planning_interval is not None and (
                 self.step_number == 1 or (self.step_number - 1) % self.planning_interval == 0
             ):
-                planning_start_time = time.time()  # 记录计划开始时间
+                planning_start_time = time.time()
                 planning_step = None
                 for element in self._generate_planning_step(
                     task, is_first_step=len(self.memory.steps) == 1, step=self.step_number
-                ):  # 生成计划步骤
-                    yield element  # 生成器返回元素
-                    planning_step = element  # 记录最后一个生成的计划步骤
-                assert isinstance(planning_step, PlanningStep)  # 断言最后一个生成的元素是PlanningStep类型
-                planning_end_time = time.time()  # 记录计划结束时间
+                ):  # Don't use the attribute step_number here, because there can be steps from previous runs
+                    yield element
+                    planning_step = element
+                assert isinstance(planning_step, PlanningStep)  # Last yielded element should be a PlanningStep
+                planning_end_time = time.time()
                 planning_step.timing = Timing(
                     start_time=planning_start_time,
                     end_time=planning_end_time,
-                )  # 设置计划步骤的时间信息
-                self._finalize_step(planning_step)  # 完成计划步骤的最终处理
-                self.memory.steps.append(planning_step)  # 将计划步骤添加到内存中的步骤列表中
+                )
+                self._finalize_step(planning_step)
+                self.memory.steps.append(planning_step)
 
-            # 开始执行动作步骤！
-            action_step_start_time = time.time()  # 记录动作步骤开始时间
+            # Start action step!
+            action_step_start_time = time.time()
             action_step = ActionStep(
                 step_number=self.step_number,
                 timing=Timing(start_time=action_step_start_time),
                 observations_images=images,
-            )  # 创建动作步骤对象
-            self.logger.log_rule(f"Step {self.step_number}", level=LogLevel.INFO)  # 记录日志，提示当前步骤编号
+            )
+            self.logger.log_rule(f"Step {self.step_number}", level=LogLevel.INFO)
             try:
                 for output in self._step_stream(action_step):
                     # Yield all
@@ -624,7 +607,7 @@ class MultiStepAgent(ABC):
                 self.step_number += 1
 
         if not returned_final_answer and self.step_number == max_steps + 1:
-            final_answer = self._handle_max_steps_reached(task, images)
+            final_answer = self._handle_max_steps_reached(task)
             yield action_step
         yield FinalAnswerStep(handle_agent_output_types(final_answer))
 
@@ -639,9 +622,9 @@ class MultiStepAgent(ABC):
         memory_step.timing.end_time = time.time()
         self.step_callbacks.callback(memory_step, agent=self)
 
-    def _handle_max_steps_reached(self, task: str, images: list["PIL.Image.Image"]) -> Any:
+    def _handle_max_steps_reached(self, task: str) -> Any:
         action_step_start_time = time.time()
-        final_answer = self.provide_final_answer(task, images)
+        final_answer = self.provide_final_answer(task)
         final_memory_step = ActionStep(
             step_number=self.step_number,
             error=AgentMaxStepsError("Reached max steps.", self.logger),
@@ -652,14 +635,12 @@ class MultiStepAgent(ABC):
         self._finalize_step(final_memory_step)
         self.memory.steps.append(final_memory_step)
         return final_answer.content
-    # 生成规划步骤的生成器函数，返回 ChatMessageStreamDelta 或 PlanningStep 类型的对象
+
     def _generate_planning_step(
         self, task, is_first_step: bool, step: int
     ) -> Generator[ChatMessageStreamDelta | PlanningStep]:
         start_time = time.time()
-        # 如果是第一步
         if is_first_step:
-            # 构建用户输入消息
             input_messages = [
                 ChatMessage(
                     role=MessageRole.USER,
@@ -674,7 +655,6 @@ class MultiStepAgent(ABC):
                     ],
                 )
             ]
-            # 如果支持流式输出且模型具有生成流的方法
             if self.stream_outputs and hasattr(self.model, "generate_stream"):
                 plan_message_content = ""
                 output_stream = self.model.generate_stream(input_messages, stop_sequences=["<end_plan>"])  # type: ignore
@@ -685,28 +665,22 @@ class MultiStepAgent(ABC):
                             plan_message_content += event.content
                             live.update(Markdown(plan_message_content))
                             if event.token_usage:
-                                output_tokens += event.token_usage.output_tokens
                                 input_tokens = event.token_usage.input_tokens
+                                output_tokens += event.token_usage.output_tokens
                         yield event
             else:
-                # 生成规划消息
-                plan_message = self.model.generate(input_messages, stop_sequences=["<end_plan"])
+                plan_message = self.model.generate(input_messages, stop_sequences=["<end_plan>"])
                 plan_message_content = plan_message.content
-                input_tokens, output_tokens = (
-                    (
-                        plan_message.token_usage.input_tokens,
-                        plan_message.token_usage.output_tokens,
-                    )
-                    if plan_message.token_usage
-                    else (None, None)
-                )
-            # 生成规划
+                input_tokens, output_tokens = 0, 0
+                if plan_message.token_usage:
+                    input_tokens = plan_message.token_usage.input_tokens
+                    output_tokens = plan_message.token_usage.output_tokens
             plan = textwrap.dedent(
-                f"""Here are the facts I know and the plan of action that I will follow to solve the task:\n\n{plan_message_content}\n"""
+                f"""Here are the facts I know and the plan of action that I will follow to solve the task:\n```\n{plan_message_content}\n```"""
             )
         else:
-            # 摘要模式移除系统提示和模型输出的先前规划消息
-            # 移除先前的规划消息避免过多影响新计划
+            # Summary mode removes the system prompt and previous planning messages output by the model.
+            # Removing previous planning messages avoids influencing too much the new plan.
             memory_messages = self.write_memory_to_messages(summary_mode=True)
             plan_update_pre = ChatMessage(
                 role=MessageRole.SYSTEM,
@@ -749,24 +723,20 @@ class MultiStepAgent(ABC):
                             plan_message_content += event.content
                             live.update(Markdown(plan_message_content))
                             if event.token_usage:
-                                output_tokens += event.token_usage.output_tokens
                                 input_tokens = event.token_usage.input_tokens
+                                output_tokens += event.token_usage.output_tokens
                         yield event
             else:
-                # 生成规划消息
                 plan_message = self.model.generate(input_messages, stop_sequences=["<end_plan>"])
                 plan_message_content = plan_message.content
-                if plan_message.token_usage is not None:
-                    input_tokens, output_tokens = (
-                        plan_message.token_usage.input_tokens,
-                        plan_message.token_usage.output_tokens,
-                    )
-            # 生成规划
+                input_tokens, output_tokens = 0, 0
+                if plan_message.token_usage:
+                    input_tokens = plan_message.token_usage.input_tokens
+                    output_tokens = plan_message.token_usage.output_tokens
             plan = textwrap.dedent(
-                f"""I still need to solve the task I was given:\n\n{self.task}\n\n\nHere are the facts I know and my new/updated plan of action to solve the task:\n\n{plan_message_content}\n"""
+                f"""I still need to solve the task I was given:\n```\n{self.task}\n```\n\nHere are the facts I know and my new/updated plan of action to solve the task:\n```\n{plan_message_content}\n```"""
             )
         log_headline = "Initial plan" if is_first_step else "Updated plan"
-        # 记录规划步骤
         self.logger.log(Rule(f"[bold]{log_headline}", style="orange"), Text(plan), level=LogLevel.INFO)
         yield PlanningStep(
             model_input_messages=input_messages,
@@ -775,6 +745,7 @@ class MultiStepAgent(ABC):
             token_usage=TokenUsage(input_tokens=input_tokens, output_tokens=output_tokens),
             timing=Timing(start_time=start_time, end_time=time.time()),
         )
+
     @abstractmethod
     def initialize_system_prompt(self) -> str:
         """To be implemented in child classes"""
@@ -789,9 +760,9 @@ class MultiStepAgent(ABC):
         summary_mode: bool = False,
     ) -> list[ChatMessage]:
         """
-        将过去的llm_output，动作和观察结果或错误从内存中读取到一系列消息中
-        可以用作LLM的输入。添加了许多关键字（例如计划，错误等）来帮助
-        LLM。
+        Reads past llm_outputs, actions, and observations or errors from the memory into a series of messages
+        that can be used as input to the LLM. Adds a number of keywords (such as PLAN, error, etc) to help
+        the LLM.
         """
         messages = self.memory.system_prompt.to_messages(summary_mode=summary_mode)
         for memory_step in self.memory.steps:
@@ -836,7 +807,7 @@ class MultiStepAgent(ABC):
             )
         return rationale.strip(), action.strip()
 
-    def provide_final_answer(self, task: str, images: list["PIL.Image.Image"] | None = None) -> ChatMessage:
+    def provide_final_answer(self, task: str) -> ChatMessage:
         """
         Provide the final answer to the task, based on the logs of the agent's interactions.
 
@@ -858,8 +829,6 @@ class MultiStepAgent(ABC):
                 ],
             )
         ]
-        if images:
-            messages[0].content += [{"type": "image", "image": image} for image in images]
         messages += self.write_memory_to_messages()[1:]
         messages.append(
             ChatMessage(
@@ -922,18 +891,18 @@ class MultiStepAgent(ABC):
 
     def save(self, output_dir: str | Path, relative_path: str | None = None):
         """
-        为您的代理保存相关的代码文件。这将在“ output_dir”中复制您的代理的代码以及自动化：
+        Saves the relevant code files for your agent. This will copy the code of your agent in `output_dir` as well as autogenerate:
 
-         - 一个“工具”文件夹，其中包含``工具/{tool_name} .py''下的每个工具的逻辑。
-         - 一个``takaned_agents`文件夹''，该文件夹包含每个托管代理的逻辑。
-         - 一个包含代表您的代理的字典的'agent.json`文件。
-         - 一个`提示。yaml`文件，其中包含代理使用的提示模板。
-         - 一个`app.py'文件，当您的代理将其导出到使用`egent.push_to_hub（）``
-         - 一个`ruesignt.txt`包含工具使用的模块的名称（如在检查其时检测到的
-          代码）
+        - a `tools` folder containing the logic for each of the tools under `tools/{tool_name}.py`.
+        - a `managed_agents` folder containing the logic for each of the managed agents.
+        - an `agent.json` file containing a dictionary representing your agent.
+        - a `prompt.yaml` file containing the prompt templates used by your agent.
+        - an `app.py` file providing a UI for your agent when it is exported to a Space with `agent.push_to_hub()`
+        - a `requirements.txt` containing the names of the modules used by your tool (as detected when inspecting its
+          code)
 
-        args：
-            output_dir（'str`或`路径）：要保存代理的文件夹。
+        Args:
+            output_dir (`str` or `Path`): The folder in which you want to save your agent.
         """
         make_init_file(output_dir)
 
@@ -1527,7 +1496,7 @@ class CodeAgent(MultiStepAgent):
         prompt_templates ([`~agents.PromptTemplates`], *optional*): Prompt templates.
         additional_authorized_imports (`list[str]`, *optional*): Additional authorized imports for the agent.
         planning_interval (`int`, *optional*): Interval at which the agent will run a planning step.
-        executor_type (`Literal["local", "e2b", "docker", "wasm"]`, default `"local"`): Type of code executor.
+        executor_type (`Literal["local", "e2b", "modal", "docker", "wasm"]`, default `"local"`): Type of code executor.
         executor_kwargs (`dict`, *optional*): Additional arguments to pass to initialize the executor.
         max_print_outputs_length (`int`, *optional*): Maximum length of the print outputs.
         stream_outputs (`bool`, *optional*, default `False`): Whether to stream outputs during execution.
@@ -1545,7 +1514,7 @@ class CodeAgent(MultiStepAgent):
         prompt_templates: PromptTemplates | None = None,
         additional_authorized_imports: list[str] | None = None,
         planning_interval: int | None = None,
-        executor_type: Literal["local", "e2b", "docker", "wasm"] = "local",
+        executor_type: Literal["local", "e2b", "modal", "docker", "wasm"] = "local",
         executor_kwargs: dict[str, Any] | None = None,
         max_print_outputs_length: int | None = None,
         stream_outputs: bool = False,
@@ -1557,19 +1526,15 @@ class CodeAgent(MultiStepAgent):
         self.authorized_imports = sorted(set(BASE_BUILTIN_MODULES) | set(self.additional_authorized_imports))
         self.max_print_outputs_length = max_print_outputs_length
         self._use_structured_outputs_internally = use_structured_outputs_internally
-        # 如果内部使用结构化输出(_use_structured_outputs_internally为True)，则加载结构化代码代理的提示模板
         if self._use_structured_outputs_internally:
-            # 如果未提供提示模板，则使用yaml.safe_load加载结构化代码代理的默认提示模板
             prompt_templates = prompt_templates or yaml.safe_load(
                 importlib.resources.files("smolagents.prompts").joinpath("structured_code_agent.yaml").read_text()
             )
-        # 如果内部不使用结构化输出(_use_structured_outputs_internally为False)，则加载非结构化代码代理的提示模板
         else:
-            # 如果未提供提示模板，则使用yaml.safe_load加载非结构化代码代理的默认提示模板
-            # 如果 prompt_templates 为 None 或空值，则加载指定路径下的 code_agent.yaml 文件内容作为默认值
             prompt_templates = prompt_templates or yaml.safe_load(
                 importlib.resources.files("smolagents.prompts").joinpath("code_agent.yaml").read_text()
             )
+
         if isinstance(code_block_tags, str) and not code_block_tags == "markdown":
             raise ValueError("Only 'markdown' is supported for a string argument to `code_block_tags`.")
         self.code_block_tags = (
@@ -1597,7 +1562,7 @@ class CodeAgent(MultiStepAgent):
                 "Caution: you set an authorization for all imports, meaning your agent can decide to import any package it deems necessary. This might raise issues if the package is not installed in your environment.",
                 level=LogLevel.INFO,
             )
-        if executor_type not in {"local", "e2b", "docker", "wasm"}:
+        if executor_type not in {"local", "e2b", "modal", "docker", "wasm"}:
             raise ValueError(f"Unsupported executor type: {executor_type}")
         self.executor_type = executor_type
         self.executor_kwargs: dict[str, Any] = executor_kwargs or {}
@@ -1615,30 +1580,24 @@ class CodeAgent(MultiStepAgent):
             self.python_executor.cleanup()
 
     def create_python_executor(self) -> PythonExecutor:
-        # 如果执行器类型为"local"，则创建本地Python执行器
         if self.executor_type == "local":
-            # 使用LocalPythonExecutor类创建本地Python执行器实例
-            # 传入额外授权的导入模块和执行器参数
             return LocalPythonExecutor(
                 self.additional_authorized_imports,
                 **{"max_print_outputs_length": self.max_print_outputs_length} | self.executor_kwargs,
             )
         else:
-            # 如果执行器类型不是"local"
-            # 检查是否启用了托管代理，如果启用了，则抛出异常
             if self.managed_agents:
                 raise Exception("Managed agents are not yet supported with remote code execution.")
-            # 远程执行器字典，根据执行器类型选择对应的远程执行器类
             remote_executors = {
                 "e2b": E2BExecutor,
                 "docker": DockerExecutor,
                 "wasm": WasmExecutor,
+                "modal": ModalExecutor,
             }
-            # 根据执行器类型创建对应的远程执行器实例
-            # 传入额外授权的导入模块、日志记录器和执行器参数
             return remote_executors[self.executor_type](
                 self.additional_authorized_imports, self.logger, **self.executor_kwargs
             )
+
     def initialize_system_prompt(self) -> str:
         system_prompt = populate_template(
             self.prompt_templates["system_prompt"],
@@ -1661,9 +1620,9 @@ class CodeAgent(MultiStepAgent):
         self, memory_step: ActionStep
     ) -> Generator[ChatMessageStreamDelta | ToolCall | ToolOutput | ActionOutput]:
         """
-        # 在 ReAct 框架中执行一步操作：代理程序思考、行动，并观察结果。
-        # 如果启用了流式处理，则在运行过程中生成 ChatMessageStreamDelta。
-        # 最后，如果该步骤不是最终步骤，则生成 None；如果是最终步骤，则生成最终答案。
+        Perform one step in the ReAct framework: the agent thinks, acts, and observes the result.
+        Yields ChatMessageStreamDelta during the run if streaming is enabled.
+        At the end, yields either None if the step is not final, or the final answer.
         """
         memory_messages = self.write_memory_to_messages()
 
@@ -1710,8 +1669,8 @@ class CodeAgent(MultiStepAgent):
                 )
 
             if not self._use_structured_outputs_internally:
-                # 将结束代码序列（即闭合代码块标记）添加到历史记录中。
-                # 这将促使后续的LLM调用以这个结束代码序列结束，从而有效地停止生成。
+                # This adds the end code sequence (i.e. the closing code block tag) to the history.
+                # This will nudge subsequent LLM calls to finish with this end code sequence, thus efficiently stopping generation.
                 if output_text and not output_text.strip().endswith(self.code_block_tags[1]):
                     output_text += self.code_block_tags[1]
                     memory_step.model_output_message.content = output_text
