@@ -23,20 +23,67 @@ The agent is executed in a background thread using `anyio.to_thread.run_sync`, a
 
 ## Usage
 
-1. **Install dependencies**:
-   ```bash
-   pip install smolagents starlette anyio uvicorn
-   ```
+Choose a backend. If you saw a 402 Payment Required from Hugging Face Inference Providers, prefer the OpenAI-compatible route below.
 
-2. **Run the app**:
-   ```bash
-   uvicorn async_codeagent_starlette.main:app --reload
-   ```
+### A) Hugging Face Inference Providers (default)
 
-3. **Test the endpoint**:
-   ```bash
-   curl -X POST http://localhost:8000/run-agent -H 'Content-Type: application/json' -d '{"task": "What is 2+2?"}'
-   ```
+1) Install deps
+```bash
+pip install -e .  # install local smolagents
+pip install starlette anyio uvicorn
+```
+
+2) Set token (requires sufficient credits)
+```bash
+export HF_TOKEN=your_hf_token
+# Optional:
+# export HF_MODEL_ID="Qwen/Qwen2.5-Coder-32B-Instruct"
+# export HF_PROVIDER="hf-inference"
+```
+
+3) Run
+```bash
+cd examples/async_agent && uvicorn main:app --reload
+```
+
+### B) OpenAI-compatible (OpenAI / Ollama / LM Studio)
+
+1) Install deps (OpenAI client)
+```bash
+pip install -e .
+pip install starlette anyio uvicorn "smolagents[openai]"
+```
+
+2) Configure one of the following:
+
+- OpenAI
+```bash
+export SMOLAGENTS_BACKEND=openai
+export OPENAI_API_KEY=sk-...
+# Optional: OPENAI_MODEL=gpt-4o-mini
+```
+
+- Ollama (local)
+```bash
+# Ensure Ollama is installed and a model is available:
+#   brew install ollama && ollama run llama3.1
+export SMOLAGENTS_BACKEND=ollama
+export OPENAI_BASE_URL=http://localhost:11434/v1
+export OPENAI_MODEL=llama3.1
+export OPENAI_API_KEY=ollama
+```
+
+3) Run
+```bash
+cd examples/async_agent && uvicorn main:app --reload
+```
+
+### Test the endpoint
+```bash
+curl -X POST http://127.0.0.1:8000/run-agent \
+  -H 'Content-Type: application/json' \
+  -d '{"task": "What is 2+2?"}'
+```
 
 ## Files
 

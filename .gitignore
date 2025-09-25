@@ -155,3 +155,6 @@ tool_output/
 .gradio/
 /examples/chainlit_travel_planner/.chainlit/
 /examples/chainlit_travel_planner/.chainlit/
+
+# Local databases (avoid committing secrets)
+myapp/*.db
