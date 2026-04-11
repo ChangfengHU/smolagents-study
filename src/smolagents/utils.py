@@ -21,13 +21,15 @@ import inspect
 import json
 import keyword
 import os
+import random
 import re
 import time
 from functools import lru_cache
 from io import BytesIO
+from logging import Logger
 from pathlib import Path
 from textwrap import dedent
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 import jinja2
 
@@ -59,17 +61,32 @@ BASE_BUILTIN_MODULES = [
 ]
 
 
-def escape_code_brackets(text: str) -> str:
-    """Escapes square brackets in code segments while preserving Rich styling tags."""
+def sanitize_for_rich(value) -> str:
+    """
+    Convert arbitrary values (including bytes / control characters) into a safe string for Rich.
+    - Decodes bytes-like inputs using UTF-8 with replacement.
+    - Escapes bracket sequences that could be interpreted as markup while preserving valid Rich tags.
+    - Replaces ASCII control characters (except common whitespace) with visible escape sequences.
+    """
+    if value is None:
+        s = ""
+    elif isinstance(value, str):
+        s = value
+    elif isinstance(value, (bytes, bytearray, memoryview)):
+        s = bytes(value).decode("utf-8", errors="replace")
+    else:
+        s = str(value)
 
-    def replace_bracketed_content(match):
-        content = match.group(1)
-        cleaned = re.sub(
-            r"bold|red|green|blue|yellow|magenta|cyan|white|black|italic|dim|\s|#[0-9a-fA-F]{6}", "", content
-        )
-        return f"\\[{content}\\]" if cleaned.strip() else f"[{content}]"
-
-    return re.sub(r"\[([^\]]*)\]", replace_bracketed_content, text)
+    out: list[str] = []
+    for ch in s:
+        code = ord(ch)
+        if ch in ("\n", "\t", "\r"):
+            out.append(ch)
+        elif code < 32 or code == 127:
+            out.append(f"\\x{code:02x}")
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
 class AgentError(Exception):
@@ -515,3 +532,84 @@ class RateLimiter:
             time.sleep(self._interval - elapsed)
         # 更新上次调用的时间戳为当前时间，用于下一次调用时计算时间间隔
         self._last_call = time.time()
+
+
+class Retrying:
+    """Simple retrying controller. Inspired from library [tenacity](https://github.com/jd/tenacity/)."""
+
+    def __init__(
+        self,
+        max_attempts: int = 1,
+        wait_seconds: float = 0.0,
+        exponential_base: float = 2.0,
+        jitter: bool = True,
+        retry_predicate: Callable[[BaseException], bool] | None = None,
+        reraise: bool = False,
+        before_sleep_logger: tuple[Logger, int] | None = None,
+        after_logger: tuple[Logger, int] | None = None,
+    ):
+        self.max_attempts = max_attempts
+        self.wait_seconds = wait_seconds
+        self.exponential_base = exponential_base
+        self.jitter = jitter
+        self.retry_predicate = retry_predicate
+        self.reraise = reraise
+        self.before_sleep_logger = before_sleep_logger
+        self.after_logger = after_logger
+
+    def __call__(self, fn, *args: Any, **kwargs: Any) -> Any:
+        start_time = time.time()
+        delay = self.wait_seconds
+
+        for attempt_number in range(1, self.max_attempts + 1):
+            try:
+                result = fn(*args, **kwargs)
+
+                # Log after successful call if we had retries
+                if self.after_logger and attempt_number > 1:
+                    logger, log_level = self.after_logger
+                    seconds = time.time() - start_time
+                    fn_name = getattr(fn, "__name__", repr(fn))
+                    logger.log(
+                        log_level,
+                        f"Finished call to '{fn_name}' after {seconds:.3f}(s), this was attempt n°{attempt_number}/{self.max_attempts}.",
+                    )
+
+                return result
+
+            except BaseException as e:
+                # Check if we should retry
+                should_retry = self.retry_predicate(e) if self.retry_predicate else False
+
+                # If this is the last attempt or we shouldn't retry, raise
+                if not should_retry or attempt_number >= self.max_attempts:
+                    if self.reraise:
+                        raise
+                    raise
+
+                # Log after failed attempt
+                if self.after_logger:
+                    logger, log_level = self.after_logger
+                    seconds = time.time() - start_time
+                    fn_name = getattr(fn, "__name__", repr(fn))
+                    logger.log(
+                        log_level,
+                        f"Finished call to '{fn_name}' after {seconds:.3f}(s), this was attempt n°{attempt_number}/{self.max_attempts}.",
+                    )
+
+                # Exponential backoff with jitter
+                # https://cookbook.openai.com/examples/how_to_handle_rate_limits#example-3-manual-backoff-implementation
+                delay *= self.exponential_base * (1 + self.jitter * random.random())
+
+                # Log before sleeping
+                if self.before_sleep_logger:
+                    logger, log_level = self.before_sleep_logger
+                    fn_name = getattr(fn, "__name__", repr(fn))
+                    logger.log(
+                        log_level,
+                        f"Retrying {fn_name} in {delay} seconds as it raised {e.__class__.__name__}: {e}.",
+                    )
+
+                # Sleep before next attempt
+                if delay > 0:
+                    time.sleep(delay)

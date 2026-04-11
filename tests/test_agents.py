@@ -664,7 +664,7 @@ nested_answer()
     def test_final_answer_checks(self):
         error_string = "failed with error"
 
-        def check_always_fails(final_answer, agent_memory):
+        def check_always_fails(final_answer, memory, agent):
             assert False, "Error raised in check"
 
         agent = CodeAgent(model=FakeCodeModel(), tools=[], final_answer_checks=[check_always_fails])
@@ -675,12 +675,66 @@ nested_answer()
         agent = CodeAgent(
             model=FakeCodeModel(),
             tools=[],
-            final_answer_checks=[lambda x, y: x == 7.2904],
+            final_answer_checks=[lambda x, memory, agent: x == 7.2904],
+            verbosity_level=1000,
         )
         output = agent.run("Dummy task.")
         assert output == 7.2904  # Check that output is correct
         assert len([step for step in agent.memory.steps if isinstance(step, ActionStep)]) == 2
         assert error_string not in str(agent.write_memory_to_messages())
+
+    def test_final_answer_checks_with_agent_access(self):
+        """Test that final answer checks can access agent properties."""
+
+        def check_uses_agent_properties(final_answer, memory, agent):
+            # Access agent properties to validate the final answer
+            assert hasattr(agent, "memory"), "Agent should have memory attribute"
+            assert hasattr(agent, "state"), "Agent should have state attribute"
+            assert hasattr(agent, "task"), "Agent should have task attribute"
+
+            # Check that the final answer is related to the task
+            if isinstance(final_answer, str):
+                return len(final_answer) > 0
+            return True
+
+        def check_uses_agent_state(final_answer, memory, agent):
+            # Use agent state to validate the answer
+            if "expected_answer" in agent.state:
+                return final_answer == agent.state["expected_answer"]
+            return True
+
+        # Test with a check that uses agent properties
+        agent = CodeAgent(model=FakeCodeModel(), tools=[], final_answer_checks=[check_uses_agent_properties])
+        output = agent.run("Dummy task.")
+        assert output == 7.2904  # Should pass the check
+
+        # Test with a check that uses agent state
+        agent = CodeAgent(model=FakeCodeModel(), tools=[], final_answer_checks=[check_uses_agent_state])
+        agent.state["expected_answer"] = 7.2904
+        output = agent.run("Dummy task.")
+        assert output == 7.2904  # Should pass the check
+
+        # Test with a check that fails due to state mismatch
+        agent = CodeAgent(
+            model=FakeCodeModel(),
+            tools=[],
+            final_answer_checks=[check_uses_agent_state],
+            max_steps=3,  # Limit steps to avoid long test run
+        )
+        agent.state["expected_answer"] = "wrong answer"
+        output = agent.run("Dummy task.")
+
+        # The agent should have reached max steps and provided a final answer anyway
+        assert output is not None
+        # Check that there were failed validation attempts in the memory
+        failed_steps = [step for step in agent.memory.steps if hasattr(step, "error") and step.error is not None]
+        assert len(failed_steps) > 0, "Expected some steps to have validation errors"
+
+        # Check that at least one error message contains our check function name
+        error_messages = [str(step.error) for step in failed_steps if step.error is not None]
+        assert any("check_uses_agent_state failed" in msg for msg in error_messages), (
+            "Expected to find validation error message"
+        )
 
     def test_generation_errors_are_raised(self):
         class FakeCodeModel(Model):
@@ -1096,12 +1150,14 @@ class TestMultiStepAgent:
         action_step_callback_2 = MagicMock()
         planning_step_callback = MagicMock()
         step_callback = MagicMock()
+        final_answer_step_callback = MagicMock()
 
         # Register callbacks for different step types
         step_callbacks = {
             ActionStep: [action_step_callback, action_step_callback_2],
             PlanningStep: planning_step_callback,
             MemoryStep: step_callback,
+            FinalAnswerStep: final_answer_step_callback,
         }
         agent = DummyMultiStepAgent(tools=[], model=MagicMock(), step_callbacks=step_callbacks)
 
@@ -1113,6 +1169,7 @@ class TestMultiStepAgent:
             model_output_message=ChatMessage(role="assistant", content="Test plan"),
             plan="Test planning step",
         )
+        final_answer_step = FinalAnswerStep(output="Sample output")
 
         # Test with ActionStep
         agent._finalize_step(action_step)
@@ -1122,12 +1179,14 @@ class TestMultiStepAgent:
         action_step_callback_2.assert_called_once_with(action_step, agent=agent)
         step_callback.assert_called_once_with(action_step, agent=agent)
         planning_step_callback.assert_not_called()
+        final_answer_step_callback.assert_not_called()
 
         # Reset mocks
         action_step_callback.reset_mock()
         action_step_callback_2.reset_mock()
         planning_step_callback.reset_mock()
         step_callback.reset_mock()
+        final_answer_step_callback.reset_mock()
 
         # Test with PlanningStep
         agent._finalize_step(planning_step)
@@ -1137,6 +1196,24 @@ class TestMultiStepAgent:
         step_callback.assert_called_once_with(planning_step, agent=agent)
         action_step_callback.assert_not_called()
         action_step_callback_2.assert_not_called()
+        final_answer_step_callback.assert_not_called()
+
+        # Reset mocks
+        action_step_callback.reset_mock()
+        action_step_callback_2.reset_mock()
+        planning_step_callback.reset_mock()
+        step_callback.reset_mock()
+        final_answer_step_callback.reset_mock()
+
+        # Test with PlanningStep
+        agent._finalize_step(final_answer_step)
+
+        # Verify correct callbacks were called
+        planning_step_callback.assert_not_called()
+        step_callback.assert_called_once_with(final_answer_step, agent=agent)
+        action_step_callback.assert_not_called()
+        action_step_callback_2.assert_not_called()
+        final_answer_step_callback.assert_called_once_with(final_answer_step, agent=agent)
 
     def test_logs_display_thoughts_even_if_error(self):
         class FakeJsonModelNoCall(Model):
@@ -1436,9 +1513,12 @@ class TestMultiStepAgent:
             "description": "Test agent description",
         }
 
-        # Call from_dict
-        with patch("smolagents.models.TransformersModel") as mock_model_class:
-            mock_model_instance = mock_model_class.from_dict.return_value
+        # Call from_dict: mock the MODEL_REGISTRY to return a mock model class
+        mock_model_class = MagicMock()
+        mock_model_instance = MagicMock()
+        mock_model_class.from_dict.return_value = mock_model_instance
+
+        with patch.dict("smolagents.models.MODEL_REGISTRY", {"TransformersModel": mock_model_class}):
             agent = DummyMultiStepAgent.from_dict(agent_dict)
 
         # Verify the agent was created correctly
@@ -1459,7 +1539,7 @@ class TestMultiStepAgent:
         assert agent.tools["valid_tool_function"]("test") == "TEST"
 
         # Test overriding with kwargs
-        with patch("smolagents.models.TransformersModel") as mock_model_class:
+        with patch.dict("smolagents.models.MODEL_REGISTRY", {"TransformersModel": mock_model_class}):
             agent = DummyMultiStepAgent.from_dict(agent_dict, max_steps=30)
         assert agent.max_steps == 30
 
@@ -1495,29 +1575,12 @@ class TestMultiStepAgent:
         assert managed_agent_dict["max_steps"] == 5
 
         # Test round-trip: from_dict should recreate the agent
-        # Mock the model classes directly instead of patching smolagents.models.MagicMock
-        with patch("smolagents.agents.importlib.import_module") as mock_import:
-            # Mock the models module
-            mock_models_module = MagicMock()
-            mock_model_class = MagicMock()
-            mock_model_instance = MagicMock()
-            mock_model_class.from_dict.return_value = mock_model_instance
-            mock_models_module.MagicMock = mock_model_class
+        # Mock the model class for the test
+        mock_model_class = MagicMock()
+        mock_model_instance = MagicMock()
+        mock_model_class.from_dict.return_value = mock_model_instance
 
-            # Mock the agents module
-            mock_agents_module = MagicMock()
-            mock_agents_module.CodeAgent = CodeAgent
-            mock_agents_module.ToolCallingAgent = ToolCallingAgent
-
-            def side_effect(module_name):
-                if module_name == "smolagents.models":
-                    return mock_models_module
-                elif module_name == "smolagents.agents":
-                    return mock_agents_module
-                return MagicMock()
-
-            mock_import.side_effect = side_effect
-
+        with patch.dict("smolagents.models.MODEL_REGISTRY", {"MagicMock": mock_model_class}):
             recreated_agent = ToolCallingAgent.from_dict(agent_dict)
 
         # Verify the recreated agent has the same structure
@@ -1530,6 +1593,53 @@ class TestMultiStepAgent:
         assert recreated_managed_agent.name == "managed_agent"
         assert recreated_managed_agent.description == "A managed agent for testing"
         assert recreated_managed_agent.max_steps == 5
+
+    def test_from_dict_invalid_model_class(self):
+        """Test that from_dict raises ValueError with helpful message for invalid model class."""
+        agent_dict = {
+            "class": "CodeAgent",
+            "model": {"class": "InvalidModelClass", "data": {}},
+            "tools": [],
+            "managed_agents": [],
+        }
+
+        with pytest.raises(ValueError) as exc_info:
+            CodeAgent.from_dict(agent_dict)
+
+        error_message = str(exc_info.value)
+        assert "InvalidModelClass" in error_message
+        assert "Unknown model class" in error_message
+        assert "Supported models:" in error_message
+
+    def test_from_dict_invalid_agent_class(self):
+        """Test that from_dict raises ValueError with helpful message for invalid agent class."""
+        # Create a valid agent first
+        agent = CodeAgent(tools=[], model=MagicMock(), name="test_agent")
+        agent_dict = agent.to_dict()
+
+        # Add a managed agent with invalid class
+        agent_dict["managed_agents"] = [
+            {
+                "class": "InvalidAgentClass",
+                "model": {"class": "MagicMock", "data": {}},
+                "tools": [],
+                "managed_agents": [],
+            }
+        ]
+
+        # Mock the model registry to allow the main agent's model and managed agent's model
+        mock_model_class = MagicMock()
+        mock_model_instance = MagicMock()
+        mock_model_class.from_dict.return_value = mock_model_instance
+
+        with patch.dict("smolagents.models.MODEL_REGISTRY", {"MagicMock": mock_model_class}):
+            with pytest.raises(ValueError) as exc_info:
+                CodeAgent.from_dict(agent_dict)
+
+            error_message = str(exc_info.value)
+            assert "InvalidAgentClass" in error_message
+            assert "Unknown agent class" in error_message
+            assert "Supported agents:" in error_message
 
 
 class TestToolCallingAgent:
@@ -1621,7 +1731,7 @@ class TestToolCallingAgent:
     def test_toolcalling_agent_stream_logs_multiple_tool_calls_observations(self, mock_openai_client, test_tool):
         """Test that ToolCallingAgent with stream_outputs=True logs the observations of all tool calls when multiple are called."""
         mock_client = mock_openai_client.return_value
-        from smolagents import OpenAIServerModel
+        from smolagents import OpenAIModel
 
         # Mock streaming response with multiple tool calls
         mock_deltas = [
@@ -1694,7 +1804,7 @@ class TestToolCallingAgent:
         mock_usage.prompt_tokens = 10
         mock_usage.completion_tokens = 20
 
-        model = OpenAIServerModel(model_id="fakemodel")
+        model = OpenAIModel(model_id="fakemodel")
 
         agent = ToolCallingAgent(model=model, tools=[test_tool], max_steps=1, stream_outputs=True)
         agent.run("Dummy task")
@@ -1709,7 +1819,7 @@ class TestToolCallingAgent:
         """Test that ToolCallingAgent with stream_outputs=True returns the all tool calls when multiple are called."""
         mock_client = mock_openai_client.return_value
 
-        from smolagents import OpenAIServerModel
+        from smolagents import OpenAIModel
 
         class ExtendedChatMessage(ChatMessage):
             def __init__(self, *args, usage, **kwargs):
@@ -1767,7 +1877,7 @@ class TestToolCallingAgent:
             )
         )
 
-        model = OpenAIServerModel(model_id="fakemodel")
+        model = OpenAIModel(model_id="fakemodel")
 
         agent = ToolCallingAgent(model=model, tools=[test_tool], max_steps=1)
         agent.run("Dummy task")
@@ -2033,7 +2143,9 @@ class TestCodeAgent:
 
         with agent.logger.console.capture() as capture:
             agent.run("Test request")
-        assert "secret\\\\" in repr(capture.get())
+        # Verify [secret] is rendered literally, not interpreted as Rich markup (which would
+        # inject ANSI reset/re-apply codes like \x1b[0m\x1b[1;31m in place of the brackets).
+        assert "[secret]" in capture.get()
 
     def test_missing_import_triggers_advice_in_error_log(self):
         # Set explicit verbosity level to 1 to override the default verbosity level of -1 set in CI fixture
@@ -2138,14 +2250,18 @@ print("Ok, calculation done!")""")
     @pytest.mark.parametrize("agent_dict_version", ["v1.9", "v1.10", "v1.20"])
     def test_from_folder(self, agent_dict_version, get_agent_dict):
         agent_dict = get_agent_dict(agent_dict_version)
+        mock_model_class = MagicMock()
+        mock_model_instance = MagicMock()
+        mock_model_instance.model_id = "Qwen/Qwen2.5-Coder-32B-Instruct"
+        mock_model_class.from_dict.return_value = mock_model_instance
+
         with (
             patch("smolagents.agents.Path") as mock_path,
-            patch("smolagents.models.InferenceClientModel") as mock_model,
+            patch.dict("smolagents.models.MODEL_REGISTRY", {"InferenceClientModel": mock_model_class}),
         ):
             import json
 
             mock_path.return_value.__truediv__.return_value.read_text.return_value = json.dumps(agent_dict)
-            mock_model.from_dict.return_value.model_id = "Qwen/Qwen2.5-Coder-32B-Instruct"
             agent = CodeAgent.from_folder("ignored_dummy_folder")
         assert isinstance(agent, CodeAgent)
         assert agent.name == "test_agent"
@@ -2159,8 +2275,8 @@ print("Ok, calculation done!")""")
         assert agent.max_print_outputs_length is None
         assert agent.managed_agents == {}
         assert set(agent.tools.keys()) == {"final_answer"}
-        assert agent.model == mock_model.from_dict.return_value
-        assert mock_model.from_dict.call_args.args[0]["model_id"] == "Qwen/Qwen2.5-Coder-32B-Instruct"
+        assert agent.model == mock_model_instance
+        assert mock_model_class.from_dict.call_args.args[0]["model_id"] == "Qwen/Qwen2.5-Coder-32B-Instruct"
         assert agent.model.model_id == "Qwen/Qwen2.5-Coder-32B-Instruct"
         assert agent.logger.level == 2
         assert agent.prompt_templates["system_prompt"] == "dummy system prompt"
@@ -2191,8 +2307,11 @@ print("Ok, calculation done!")""")
         }
 
         # Call from_dict
-        with patch("smolagents.models.InferenceClientModel") as mock_model_class:
-            mock_model_instance = mock_model_class.from_dict.return_value
+        mock_model_class = MagicMock()
+        mock_model_instance = MagicMock()
+        mock_model_class.from_dict.return_value = mock_model_instance
+
+        with patch.dict("smolagents.models.MODEL_REGISTRY", {"InferenceClientModel": mock_model_class}):
             agent = CodeAgent.from_dict(agent_dict)
 
         # Verify the agent was created correctly with CodeAgent-specific parameters
@@ -2209,13 +2328,13 @@ print("Ok, calculation done!")""")
             "managed_agents": {},
         }
 
-        with patch("smolagents.models.InferenceClientModel"):
+        with patch.dict("smolagents.models.MODEL_REGISTRY", {"InferenceClientModel": mock_model_class}):
             agent = CodeAgent.from_dict(minimal_agent_dict)
         # Verify defaults are used
         assert agent.max_steps == 20  # default from MultiStepAgent.__init__
 
         # Test overriding with kwargs
-        with patch("smolagents.models.InferenceClientModel"):
+        with patch.dict("smolagents.models.MODEL_REGISTRY", {"InferenceClientModel": mock_model_class}):
             agent = CodeAgent.from_dict(
                 agent_dict,
                 additional_authorized_imports=["requests"],

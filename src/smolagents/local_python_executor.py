@@ -23,6 +23,8 @@ import math
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Generator, Mapping
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from functools import wraps
 from importlib import import_module
@@ -55,6 +57,7 @@ ERRORS = {
 DEFAULT_MAX_LEN_OUTPUT = 50000
 MAX_OPERATIONS = 10000000
 MAX_WHILE_ITERATIONS = 1000000
+MAX_EXECUTION_TIME_SECONDS = 30
 ALLOWED_DUNDER_METHODS = ["__init__", "__str__", "__repr__"]
 
 
@@ -273,6 +276,50 @@ class ReturnException(Exception):
         self.value = value
 
 
+class ExecutionTimeoutError(Exception):
+    """Exception raised when code execution exceeds the maximum allowed time."""
+
+    pass
+
+
+def timeout(timeout_seconds: int):
+    """
+    Decorator to limit the execution time of a function using threading.
+
+    This implementation is cross-platform (works on Windows) and thread-safe (works when
+    called from any thread, not just the main thread), unlike signal-based approaches.
+
+    Args:
+        timeout_seconds (`int`): Maximum time in seconds allowed for function execution.
+
+    Raises:
+        ExecutionTimeoutError: If the function execution exceeds the timeout period.
+
+    Note:
+        If a timeout occurs, the thread running the function cannot be forcefully killed
+        in Python, so it will continue running in the background until completion. However,
+        the caller will receive a TimeoutError and can continue execution.
+    """
+
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            # Create a new ThreadPoolExecutor for each call to avoid threading issues
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(func, *args, **kwargs)
+                try:
+                    result = future.result(timeout=timeout_seconds)
+                    return result
+                except FuturesTimeoutError:
+                    raise ExecutionTimeoutError(
+                        f"Code execution exceeded the maximum execution time of {timeout_seconds} seconds"
+                    )
+
+        return wrapper
+
+    return decorator
+
+
 def get_iterable(obj):
     if isinstance(obj, list):
         return obj
@@ -284,28 +331,27 @@ def get_iterable(obj):
 
 def fix_final_answer_code(code: str) -> str:
     """
-    # 有时 LLM 可能会尝试将一个变量分配给 final_answer，这会破坏 final_answer() 工具。
-    # 这个函数通过将变量分配替换为 final_answer_variable 来修复这种行为，
-    # 同时保留对 final_answer() 的函数调用。
+    Sometimes an LLM can try to assign a variable to final_answer, which would break the final_answer() tool.
+    This function fixes this behaviour by replacing variable assignments to final_answer with final_answer_variable,
+    while preserving function calls to final_answer().
     """
-
-    # 首先，查找是否有直接赋值给 final_answer 的情况
-    # 使用单词边界和负向回顾来确保它不是对象属性
+    # First, find if there's a direct assignment to final_answer
+    # Use word boundary and negative lookbehind to ensure it's not an object attribute
     assignment_pattern = r"(?<!\.)(?<!\w)\bfinal_answer\s*="
     if "final_answer(" not in code or not re.search(assignment_pattern, code):
-        # 如果在此代码块中未调用 final_answer 工具，则进行替换是危险的，因为这可能会导致模型在后续步骤中出现错误。
-        # 让我们不修改代码，让后续的赋值错误发生。
+        # If final_answer tool is not called in this blob, then doing the replacement is hazardous because it could false the model's memory for next steps.
+        # Let's not modify the code and leave the subsequent assignment error happen.
         return code
 
-    # 用于替换变量赋值的模式
-    # 查找 'final_answer' 后面跟着 '='，并带有可选的空白字符
-    # 负向回顾确保我们不匹配对象属性
+    # Pattern for replacing variable assignments
+    # Looks for 'final_answer' followed by '=' with optional whitespace
+    # Negative lookbehind ensures we don't match object attributes
     assignment_regex = r"(?<!\.)(?<!\w)(\bfinal_answer)(\s*=)"
     code = re.sub(assignment_regex, r"final_answer_variable\2", code)
 
-    # 用于替换变量使用但不包括函数调用的模式
-    # 负向预查 (?!\s*\() 确保我们不匹配函数调用
-    # 负向回顾 (?<!\.|\w) 确保我们不匹配对象方法或其他变量
+    # Pattern for replacing variable usage but not function calls
+    # Negative lookahead (?!\s*\() ensures we don't match function calls
+    # Negative lookbehind (?<!\.|\w) ensures we don't match object methods or other variables
     variable_regex = r"(?<!\.)(?<!\w)(\bfinal_answer\b)(?!\s*\()"
     code = re.sub(variable_regex, "final_answer_variable", code)
     return code
@@ -500,7 +546,21 @@ def evaluate_class_def(
 ) -> type:
     class_name = class_def.name
     bases = [evaluate_ast(base, state, static_tools, custom_tools, authorized_imports) for base in class_def.bases]
-    class_dict = {}
+
+    # Determine the metaclass to use
+    # If any base class has a custom metaclass, use it
+    metaclass = type
+    for base in bases:
+        base_metaclass = type(base)
+        if base_metaclass is not type:
+            metaclass = base_metaclass
+            break
+
+    # Use __prepare__ if the metaclass provides it (e.g., Enum uses _EnumDict)
+    if hasattr(metaclass, "__prepare__"):
+        class_dict = metaclass.__prepare__(class_name, bases)
+    else:
+        class_dict = {}
 
     for stmt in class_def.body:
         if isinstance(stmt, ast.FunctionDef):
@@ -553,7 +613,7 @@ def evaluate_class_def(
         else:
             raise InterpreterError(f"Unsupported statement in class body: {stmt.__class__.__name__}")
 
-    new_class = type(class_name, tuple(bases), class_dict)
+    new_class = metaclass(class_name, tuple(bases), class_dict)
     state[class_name] = new_class
     return new_class
 
@@ -993,6 +1053,49 @@ def evaluate_for(
     return result
 
 
+def _evaluate_comprehensions(
+    comprehensions: list[ast.comprehension],
+    evaluate_element: Callable[[dict[str, Any]], Any],
+    state: dict[str, Any],
+    static_tools: dict[str, Callable],
+    custom_tools: dict[str, Callable],
+    authorized_imports: list[str],
+) -> Generator[Any, None, None]:
+    """
+    Recursively evaluate nested comprehensions and yields elements.
+
+    Args:
+        comprehensions (`list[ast.comprehension]`): Comprehensions to evaluate.
+        evaluate_element (`Callable`): Function that evaluates the final element when comprehensions are exhausted.
+        state (`dict[str, Any]`): Current evaluation state.
+        static_tools (`dict[str, Callable]`): Static tools.
+        custom_tools (`dict[str, Callable]`): Custom tools.
+        authorized_imports (`list[str]`): Authorized imports.
+
+    Yields:
+        `Any`: Individual elements produced by the comprehension
+    """
+    # Base case: no more comprehensions
+    if not comprehensions:
+        yield evaluate_element(state)
+        return
+    # Evaluate first comprehension
+    comprehension = comprehensions[0]
+    iter_value = evaluate_ast(comprehension.iter, state, static_tools, custom_tools, authorized_imports)
+    for value in iter_value:
+        new_state = state.copy()
+        set_value(comprehension.target, value, new_state, static_tools, custom_tools, authorized_imports)
+        # Check all filter conditions
+        if all(
+            evaluate_ast(if_clause, new_state, static_tools, custom_tools, authorized_imports)
+            for if_clause in comprehension.ifs
+        ):
+            # Recurse with remaining comprehensions
+            yield from _evaluate_comprehensions(
+                comprehensions[1:], evaluate_element, new_state, static_tools, custom_tools, authorized_imports
+            )
+
+
 def evaluate_listcomp(
     listcomp: ast.ListComp,
     state: dict[str, Any],
@@ -1000,41 +1103,16 @@ def evaluate_listcomp(
     custom_tools: dict[str, Callable],
     authorized_imports: list[str],
 ) -> list[Any]:
-    def inner_evaluate(generators: list[ast.comprehension], index: int, current_state: dict[str, Any]) -> list[Any]:
-        if index >= len(generators):
-            return [
-                evaluate_ast(
-                    listcomp.elt,
-                    current_state,
-                    static_tools,
-                    custom_tools,
-                    authorized_imports,
-                )
-            ]
-        generator = generators[index]
-        iter_value = evaluate_ast(
-            generator.iter,
-            current_state,
+    return list(
+        _evaluate_comprehensions(
+            listcomp.generators,
+            lambda comp_state: evaluate_ast(listcomp.elt, comp_state, static_tools, custom_tools, authorized_imports),
+            state,
             static_tools,
             custom_tools,
             authorized_imports,
         )
-        result = []
-        for value in iter_value:
-            new_state = current_state.copy()
-            if isinstance(generator.target, ast.Tuple):
-                for idx, elem in enumerate(generator.target.elts):
-                    new_state[elem.id] = value[idx]
-            else:
-                new_state[generator.target.id] = value
-            if all(
-                evaluate_ast(if_clause, new_state, static_tools, custom_tools, authorized_imports)
-                for if_clause in generator.ifs
-            ):
-                result.extend(inner_evaluate(generators, index + 1, new_state))
-        return result
-
-    return inner_evaluate(listcomp.generators, 0, state)
+    )
 
 
 def evaluate_setcomp(
@@ -1044,32 +1122,38 @@ def evaluate_setcomp(
     custom_tools: dict[str, Callable],
     authorized_imports: list[str],
 ) -> set[Any]:
-    result = set()
-    for gen in setcomp.generators:
-        iter_value = evaluate_ast(gen.iter, state, static_tools, custom_tools, authorized_imports)
-        for value in iter_value:
-            new_state = state.copy()
-            set_value(
-                gen.target,
-                value,
-                new_state,
-                static_tools,
-                custom_tools,
-                authorized_imports,
-            )
-            if all(
-                evaluate_ast(if_clause, new_state, static_tools, custom_tools, authorized_imports)
-                for if_clause in gen.ifs
-            ):
-                element = evaluate_ast(
-                    setcomp.elt,
-                    new_state,
-                    static_tools,
-                    custom_tools,
-                    authorized_imports,
-                )
-                result.add(element)
-    return result
+    return set(
+        _evaluate_comprehensions(
+            setcomp.generators,
+            lambda comp_state: evaluate_ast(setcomp.elt, comp_state, static_tools, custom_tools, authorized_imports),
+            state,
+            static_tools,
+            custom_tools,
+            authorized_imports,
+        )
+    )
+
+
+def evaluate_dictcomp(
+    dictcomp: ast.DictComp,
+    state: dict[str, Any],
+    static_tools: dict[str, Callable],
+    custom_tools: dict[str, Callable],
+    authorized_imports: list[str],
+) -> dict[Any, Any]:
+    return dict(
+        _evaluate_comprehensions(
+            dictcomp.generators,
+            lambda comp_state: (
+                evaluate_ast(dictcomp.key, comp_state, static_tools, custom_tools, authorized_imports),
+                evaluate_ast(dictcomp.value, comp_state, static_tools, custom_tools, authorized_imports),
+            ),
+            state,
+            static_tools,
+            custom_tools,
+            authorized_imports,
+        )
+    )
 
 
 def evaluate_try(
@@ -1159,20 +1243,26 @@ def evaluate_with(
     contexts = []
     for item in with_node.items:
         context_expr = evaluate_ast(item.context_expr, state, static_tools, custom_tools, authorized_imports)
+        enter_result = context_expr.__enter__()
+        contexts.append(context_expr)
         if item.optional_vars:
-            state[item.optional_vars.id] = context_expr.__enter__()
-            contexts.append(state[item.optional_vars.id])
-        else:
-            context_var = context_expr.__enter__()
-            contexts.append(context_var)
+            state[item.optional_vars.id] = enter_result
 
     try:
         for stmt in with_node.body:
             evaluate_ast(stmt, state, static_tools, custom_tools, authorized_imports)
     except Exception as e:
+        # exc_info tracks the active exception as we unwind (from innermost context manager)
+        # Resetting it to (None, None, None) signals suppression to the remaining outer managers
+        exc_info = (type(e), e, e.__traceback__)
         for context in reversed(contexts):
-            context.__exit__(type(e), e, e.__traceback__)
-        raise
+            try:
+                if context.__exit__(*exc_info):
+                    exc_info = (None, None, None)  # suppressed; outer CMs see no exception
+            except Exception as exit_exc:
+                exc_info = (type(exit_exc), exit_exc, exit_exc.__traceback__)  # new exc replaces active
+        if exc_info[1] is not None:
+            raise exc_info[1].with_traceback(exc_info[2])
     else:
         for context in reversed(contexts):
             context.__exit__(None, None, None)
@@ -1250,48 +1340,6 @@ def evaluate_import(expression, state, authorized_imports):
                 f"Import from {expression.module} is not allowed. Authorized imports are: {str(authorized_imports)}"
             )
         return None
-
-
-def evaluate_dictcomp(
-    dictcomp: ast.DictComp,
-    state: dict[str, Any],
-    static_tools: dict[str, Callable],
-    custom_tools: dict[str, Callable],
-    authorized_imports: list[str],
-) -> dict[Any, Any]:
-    result = {}
-    for gen in dictcomp.generators:
-        iter_value = evaluate_ast(gen.iter, state, static_tools, custom_tools, authorized_imports)
-        for value in iter_value:
-            new_state = state.copy()
-            set_value(
-                gen.target,
-                value,
-                new_state,
-                static_tools,
-                custom_tools,
-                authorized_imports,
-            )
-            if all(
-                evaluate_ast(if_clause, new_state, static_tools, custom_tools, authorized_imports)
-                for if_clause in gen.ifs
-            ):
-                key = evaluate_ast(
-                    dictcomp.key,
-                    new_state,
-                    static_tools,
-                    custom_tools,
-                    authorized_imports,
-                )
-                val = evaluate_ast(
-                    dictcomp.value,
-                    new_state,
-                    static_tools,
-                    custom_tools,
-                    authorized_imports,
-                )
-                result[key] = val
-    return result
 
 
 def evaluate_generatorexp(
@@ -1374,22 +1422,24 @@ def evaluate_ast(
     authorized_imports: list[str] = BASE_BUILTIN_MODULES,
 ):
     """
-    使用存储在状态中的变量内容并仅评估给定函数集的抽象语法树。
+    Evaluate an abstract syntax tree using the content of the variables stored in a state and only evaluating a given
+    set of functions.
 
-    此函数将递归遍历提供的树节点。
+    This function will recurse through the nodes of the tree provided.
 
-    参数:
+    Args:
         expression (`ast.AST`):
-            要评估的代码，作为抽象语法树。
+            The code to evaluate, as an abstract syntax tree.
         state (`Dict[str, Any]`):
-            将变量名称映射到值的字典。如果在评估过程中遇到赋值，则会更新`state`。
+            A dictionary mapping variable names to values. The `state` is updated if need be when the evaluation
+            encounters assignments.
         static_tools (`Dict[str, Callable]`):
-            在评估过程中可能被调用的函数。尝试更改这些`static_tools`将引发错误。
+            Functions that may be called during the evaluation. Trying to change one of these static_tools will raise an error.
         custom_tools (`Dict[str, Callable]`):
-            在评估过程中可能被调用的函数。这些`custom_tools`可以被覆盖。
+            Functions that may be called during the evaluation. These custom_tools can be overwritten.
         authorized_imports (`List[str]`):
-            可以被代码导入的模块列表。默认情况下，只允许导入一些安全模块。
-            如果包含“*”，则将授权任何导入。请自行承担风险使用！
+            The list of modules that can be imported by the code. By default, only a few safe modules are allowed.
+            If it contains "*", it will authorize any import. Use this at your own risk!
     """
     if state.setdefault("_operations_count", {"counter": 0})["counter"] >= MAX_OPERATIONS:
         raise InterpreterError(
@@ -1519,9 +1569,16 @@ def evaluate_ast(
         raise InterpreterError(f"{expression.__class__.__name__} is not supported.")
 
 
-class FinalAnswerException(Exception):
+class FinalAnswerException(BaseException):
+    """Exception raised when final_answer is called.
+
+    Inherits from BaseException instead of Exception to prevent being caught
+    by generic `except Exception` clauses in agent-generated code.
+    """
+
     def __init__(self, value):
         self.value = value
+
 
 def evaluate_python_code(
     code: str,
@@ -1530,79 +1587,86 @@ def evaluate_python_code(
     state: dict[str, Any] | None = None,
     authorized_imports: list[str] = BASE_BUILTIN_MODULES,
     max_print_outputs_length: int = DEFAULT_MAX_LEN_OUTPUT,
+    timeout_seconds: int | None = MAX_EXECUTION_TIME_SECONDS,
 ):
     """
-    评估Python表达式，使用状态中存储的变量内容，并仅评估给定的函数集。
+    Evaluate a python expression using the content of the variables stored in a state and only evaluating a given set
+    of functions.
 
-    此函数将递归遍历提供的树的节点。
+    This function will recurse through the nodes of the tree provided.
 
     Args:
         code (`str`):
-            要评估的代码。
+            The code to evaluate.
         static_tools (`Dict[str, Callable]`):
-            可在评估过程中调用的函数。这些也可以是多智能体设置中的代理。
-            这些工具在代码中不能被覆盖：对它们的任何赋值都会引发错误。
+            The functions that may be called during the evaluation. These can also be agents in a multiagent setting.
+            These tools cannot be overwritten in the code: any assignment to their name will raise an error.
         custom_tools (`Dict[str, Callable]`):
-            可在评估过程中调用的函数。
-            这些工具可以在代码中被覆盖：对它们的任何赋值都会覆盖它们。
+            The functions that may be called during the evaluation.
+            These tools can be overwritten in the code: any assignment to their name will overwrite them.
         state (`Dict[str, Any]`):
-            将变量名映射到值的字典。`state`应包含初始输入，但此函数将更新它以包含所有评估的变量。
-            打印输出将存储在状态下的键"_print_outputs"中。
+            A dictionary mapping variable names to values. The `state` should contain the initial inputs but will be
+            updated by this function to contain all variables as they are evaluated.
+            The print outputs will be stored in the state under the key "_print_outputs".
+        timeout_seconds (`int`, *optional*, defaults to `MAX_EXECUTION_TIME_SECONDS`):
+            Maximum time in seconds allowed for code execution. Set to `None` to disable timeout.
     """
     try:
-        expression = ast.parse(code)  # 将代码解析为抽象语法树
+        expression = ast.parse(code)
     except SyntaxError as e:
         raise InterpreterError(
-            f"Code parsing failed on line {e.lineno} due to: {type(e).__name__}\n"
+            f"Code parsing failed on line {e.lineno} due to: {type(e).__name__}: {str(e)}\n"
             f"{e.text}"
-            f"{' ' * (e.offset or 0)}^\n"
-            f"Error: {str(e)}"
+            f"{' ' * (e.offset or 0)}^"
         )
 
     if state is None:
-        state = {}  # 如果状态为None，则初始化为空字典
-    static_tools = static_tools.copy() if static_tools is not None else {}  # 创建静态工具的副本
-    custom_tools = custom_tools if custom_tools is not None else {}  # 如果自定义工具为None，则初始化为空字典
-    result = None
-    state["_print_outputs"] = PrintContainer()  # 初始化打印输出容器
-    state["_operations_count"] = {"counter": 0}  # 初始化操作计数器
+        state = {}
+    static_tools = static_tools.copy() if static_tools is not None else {}
+    custom_tools = custom_tools if custom_tools is not None else {}
+    state["_print_outputs"] = PrintContainer()
+    state["_operations_count"] = {"counter": 0}
 
     if "final_answer" in static_tools:
         previous_final_answer = static_tools["final_answer"]
 
-        def final_answer(*args, **kwargs):  # 允许传递任意参数
+        def final_answer(*args, **kwargs):  # Allow arbitrary arguments to be passed
             raise FinalAnswerException(previous_final_answer(*args, **kwargs))
 
         static_tools["final_answer"] = final_answer
 
-    try:
-        # 遍历表达式的每个节点
-        for node in expression.body:
-            # 对每个节点进行抽象语法树的评估，获取结果
-            result = evaluate_ast(node, state, static_tools, custom_tools, authorized_imports)
+    # Define the actual execution logic
+    def _execute_code():
+        result = None
+        try:
+            for node in expression.body:
+                result = evaluate_ast(node, state, static_tools, custom_tools, authorized_imports)
+            state["_print_outputs"].value = truncate_content(
+                str(state["_print_outputs"]), max_length=max_print_outputs_length
+            )
+            is_final_answer = False
+            return result, is_final_answer
+        except FinalAnswerException as e:
+            state["_print_outputs"].value = truncate_content(
+                str(state["_print_outputs"]), max_length=max_print_outputs_length
+            )
+            is_final_answer = True
+            return e.value, is_final_answer
+        except Exception as e:
+            state["_print_outputs"].value = truncate_content(
+                str(state["_print_outputs"]), max_length=max_print_outputs_length
+            )
+            raise InterpreterError(
+                f"Code execution failed at line '{ast.get_source_segment(code, node)}' due to: {type(e).__name__}: {e}"
+            )
 
-        # 截断打印输出内容，限制长度为max_print_outputs_length
-        state["_print_outputs"].value = truncate_content(str(state["_print_outputs"]), max_length=max_print_outputs_length)
+    # Apply timeout if specified
+    if timeout_seconds is not None:
+        _execute_code = timeout(timeout_seconds)(_execute_code)
 
-        # 标记是否为最终答案的标志，初始值为False
-        is_final_answer = False
+    return _execute_code()
 
-        # 返回评估结果和是否为最终答案的标志
-        return result, is_final_answer
-    #这段代码的设计意图是对表达式中的每个节点进行抽象语法树的评估，并在评估完成后截断打印输出内容，最后返回评估结果和是否为最终答案的标志。
-    except FinalAnswerException as e:
-        state["_print_outputs"].value = truncate_content(
-            str(state["_print_outputs"]), max_length=max_print_outputs_length
-        )
-        is_final_answer = True
-        return e.value, is_final_answer
-    except Exception as e:
-        state["_print_outputs"].value = truncate_content(
-            str(state["_print_outputs"]), max_length=max_print_outputs_length
-        )
-        raise InterpreterError(
-            f"Code execution failed at line '{ast.get_source_segment(code, node)}' due to: {type(e).__name__}: {e}"
-        )
+
 @dataclass
 class CodeOutput:
     output: Any
@@ -1637,6 +1701,8 @@ class LocalPythonExecutor(PythonExecutor):
             Maximum length of the print outputs.
         additional_functions (`dict[str, Callable]`, *optional*):
             Additional Python functions to be added to the executor.
+        timeout_seconds (`int`, *optional*, defaults to `MAX_EXECUTION_TIME_SECONDS`):
+            Maximum time in seconds allowed for code execution. Set to `None` to disable timeout.
     """
 
     def __init__(
@@ -1644,6 +1710,7 @@ class LocalPythonExecutor(PythonExecutor):
         additional_authorized_imports: list[str],
         max_print_outputs_length: int | None = None,
         additional_functions: dict[str, Callable] | None = None,
+        timeout_seconds: int | None = MAX_EXECUTION_TIME_SECONDS,
     ):
         self.custom_tools = {}
         self.state = {"__name__": "__main__"}
@@ -1655,6 +1722,7 @@ class LocalPythonExecutor(PythonExecutor):
         self._check_authorized_imports_are_installed()
         self.static_tools = None
         self.additional_functions = additional_functions or {}
+        self.timeout_seconds = timeout_seconds
 
     def _check_authorized_imports_are_installed(self):
         """
@@ -1684,6 +1752,7 @@ class LocalPythonExecutor(PythonExecutor):
             state=self.state,
             authorized_imports=self.authorized_imports,
             max_print_outputs_length=self.max_print_outputs_length,
+            timeout_seconds=self.timeout_seconds,
         )
         logs = str(self.state["_print_outputs"])
         return CodeOutput(output=output, logs=logs, is_final_answer=is_final_answer)

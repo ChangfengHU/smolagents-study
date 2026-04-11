@@ -1,3 +1,4 @@
+import importlib
 import io
 from textwrap import dedent
 from unittest.mock import MagicMock, patch
@@ -10,7 +11,15 @@ from rich.console import Console
 from smolagents.default_tools import FinalAnswerTool, WikipediaSearchTool
 from smolagents.local_python_executor import CodeOutput
 from smolagents.monitoring import AgentLogger, LogLevel
-from smolagents.remote_executors import DockerExecutor, E2BExecutor, ModalExecutor, RemotePythonExecutor, WasmExecutor
+from smolagents.remote_executors import (
+    BlaxelExecutor,
+    DockerExecutor,
+    E2BExecutor,
+    ModalExecutor,
+    RemotePythonExecutor,
+    WasmExecutor,
+)
+from smolagents.serialization import SerializationError
 from smolagents.utils import AgentError
 
 from .utils.markers import require_run_all
@@ -30,6 +39,43 @@ class TestRemotePythonExecutor:
         executor.run_code_raise_errors = MagicMock()
         executor.send_variables({})
         assert executor.run_code_raise_errors.call_count == 0
+
+    def test_send_variables_non_empty_generates_executable_deserializer_code(self):
+        executor = RemotePythonExecutor(additional_imports=[], logger=MagicMock(), allow_pickle=False)
+        executor.run_code_raise_errors = MagicMock()
+
+        variables = {
+            "counter": 1,
+            "tags": ("a", "b"),
+            "blob": b"binary",
+        }
+        executor.send_variables(variables)
+
+        sent_code = executor.run_code_raise_errors.call_args.args[0]
+        remote_scope = {}
+        exec(sent_code, remote_scope, remote_scope)
+
+        assert remote_scope["counter"] == 1
+        assert remote_scope["tags"] == ("a", "b")
+        assert remote_scope["blob"] == b"binary"
+
+    def test_send_variables_allow_pickle_handles_prefixed_payload(self):
+        executor = RemotePythonExecutor(additional_imports=[], logger=MagicMock(), allow_pickle=True)
+        executor.run_code_raise_errors = MagicMock()
+
+        variables = {"error": ValueError("boom")}
+        executor.send_variables(variables)
+
+        sent_code = executor.run_code_raise_errors.call_args.args[0]
+        remote_scope = {}
+        exec(sent_code, remote_scope, remote_scope)
+
+        assert isinstance(remote_scope["error"], ValueError)
+        assert str(remote_scope["error"]) == "boom"
+
+    def test_deserialize_final_answer_rejects_unprefixed_payload(self):
+        with pytest.raises(SerializationError, match="Unknown final answer format"):
+            RemotePythonExecutor._deserialize_final_answer("legacy-unprefixed-payload", allow_pickle=True)
 
     @require_run_all
     def test_send_tools_with_default_wikipedia_search_tool(self):
@@ -189,6 +235,7 @@ class TestDockerExecutorUnit:
         logger = MagicMock()
         with (
             patch("docker.from_env") as mock_docker_client,
+            patch("requests.get") as mock_get,
             patch("requests.post") as mock_post,
             patch("websocket.create_connection"),
         ):
@@ -200,6 +247,7 @@ class TestDockerExecutorUnit:
             mock_docker_client.return_value.containers.run.return_value = mock_container
             mock_docker_client.return_value.images.get.return_value = MagicMock()
 
+            mock_get.return_value.status_code = 200
             mock_post.return_value.status_code = 201
             mock_post.return_value.json.return_value = {"id": "test-kernel-id"}
 
@@ -414,9 +462,8 @@ class TestModalExecutorUnit:
         assert create_call.args == (
             "jupyter",
             "kernelgateway",
-            "--KernelGatewayApp.ip='0.0.0.0'",
+            "--KernelGatewayApp.ip=0.0.0.0",
             f"--KernelGatewayApp.port={port}",
-            "--KernelGatewayApp.allow_origin='*'",
         )
         assert create_call.kwargs["timeout"] == 100
         assert create_call.kwargs["cpu"] == 2
@@ -436,7 +483,7 @@ class TestWasmExecutorUnit:
         with (
             patch("subprocess.run") as mock_run,
             patch("subprocess.Popen") as mock_popen,
-            patch("requests.get") as mock_get,
+            patch("smolagents.remote_executors.requests.Session") as mock_session_cls,
             patch("time.sleep"),
         ):
             # Configure mocks
@@ -444,7 +491,9 @@ class TestWasmExecutorUnit:
             mock_process = MagicMock()
             mock_process.poll.return_value = None
             mock_popen.return_value = mock_process
-            mock_get.return_value.status_code = 200
+            mock_session = MagicMock()
+            mock_session.get.return_value.status_code = 200
+            mock_session_cls.return_value = mock_session
 
             # Create the executor
             executor = WasmExecutor(additional_imports=["numpy", "pandas"], logger=logger, timeout=30)
@@ -465,6 +514,10 @@ class TestWasmExecutorUnit:
             assert mock_popen.call_count == 1
             assert mock_popen.call_args.args[0][0] == "deno"
             assert mock_popen.call_args.args[0][1] == "run"
+            assert (
+                "--allow-net=127.0.0.1:8000,cdn.jsdelivr.net:443,pypi.org:443,files.pythonhosted.org:443"
+                in (mock_popen.call_args.args[0])
+            )
 
             # Clean up
             with patch("shutil.rmtree"):
@@ -547,3 +600,146 @@ class TestWasmExecutorIntegration:
         with pytest.raises(AgentError) as excinfo:
             self.executor(code)
         assert "SyntaxError" in str(excinfo.value)
+
+
+class TestBlaxelExecutorUnit:
+    def test_blaxel_executor_instantiation_without_blaxel_sdk(self):
+        """Test that BlaxelExecutor raises appropriate error when blaxel SDK is not installed."""
+        logger = MagicMock()
+        with patch.dict("sys.modules", {"blaxel.core": None}):
+            with pytest.raises(ModuleNotFoundError) as excinfo:
+                BlaxelExecutor(additional_imports=[], logger=logger)
+            assert "Please install 'blaxel' extra" in str(excinfo.value)
+
+    @patch("smolagents.remote_executors._create_kernel_http")
+    @patch("blaxel.core.SandboxInstance")
+    @patch("blaxel.core.settings")
+    def test_blaxel_executor_instantiation_with_blaxel_sdk(
+        self, mock_settings, mock_sandbox_instance, mock_create_kernel
+    ):
+        """Test BlaxelExecutor instantiation with mocked Blaxel SDK."""
+
+        # patch manually for Python 3.10 compatibility
+        from unittest.mock import patch
+
+        mod = importlib.import_module("blaxel.core.client.api.compute")
+        patcher = patch.object(mod, "create_sandbox")
+        mock_create_sandbox = patcher.start()
+
+        logger = MagicMock()
+        mock_settings.headers = {}
+
+        # Mock sandbox response
+        mock_response = MagicMock()
+        mock_create_sandbox.sync.return_value = mock_response
+
+        # Mock SandboxInstance
+        mock_sandbox = MagicMock()
+        mock_metadata = MagicMock()
+        mock_metadata.url = "https://test-sandbox.bl.run"
+        mock_sandbox.metadata = mock_metadata
+        mock_sandbox_instance.return_value = mock_sandbox
+
+        # Mock kernel creation
+        mock_create_kernel.return_value = "kernel-123"
+
+        executor = BlaxelExecutor(additional_imports=[], logger=logger)
+
+        patcher.stop()
+
+        assert executor.sandbox_name.startswith("smolagent-executor-")
+        assert executor.image == "blaxel/jupyter-notebook"
+        assert executor.memory == 4096
+        assert executor.region is None
+
+    @patch("smolagents.remote_executors.BlaxelExecutor.install_packages")
+    @patch("smolagents.remote_executors._create_kernel_http")
+    @patch("blaxel.core.SandboxInstance")
+    @patch("blaxel.core.settings")
+    def test_blaxel_executor_custom_parameters(
+        self, mock_settings, mock_sandbox_instance, mock_create_kernel, mock_install_packages
+    ):
+        """Test BlaxelExecutor with custom parameters."""
+        logger = MagicMock()
+        mock_settings.headers = {}
+        mock_install_packages.return_value = ["numpy"]
+
+        # Mock sandbox response
+        mock_response = MagicMock()
+
+        # patch manually for Python 3.10 compatibility
+        mod = importlib.import_module("blaxel.core.client.api.compute")
+        create_sandbox_patcher = patch.object(mod, "create_sandbox")
+        mock_create_sandbox = create_sandbox_patcher.start()
+        mock_create_sandbox.sync.return_value = mock_response
+
+        # Mock SandboxInstance
+        mock_sandbox = MagicMock()
+        mock_metadata = MagicMock()
+        mock_metadata.url = "https://test-sandbox.us-was-1.bl.run"
+        mock_sandbox.metadata = mock_metadata
+        mock_sandbox_instance.return_value = mock_sandbox
+
+        # Mock kernel creation
+        mock_create_kernel.return_value = "kernel-123"
+
+        executor = BlaxelExecutor(
+            additional_imports=["numpy"],
+            logger=logger,
+            sandbox_name="test-sandbox",
+            image="custom-image:latest",
+            memory=8192,
+            region="us-was-1",
+        )
+
+        create_sandbox_patcher.stop()
+
+        assert executor.sandbox_name == "test-sandbox"
+        assert executor.image == "custom-image:latest"
+        assert executor.memory == 8192
+        assert executor.region == "us-was-1"
+        assert mock_install_packages.called
+
+    @patch("smolagents.remote_executors._create_kernel_http")
+    @patch("blaxel.core.SandboxInstance")
+    @patch("blaxel.core.settings")
+    def test_blaxel_executor_cleanup(self, mock_settings, mock_sandbox_instance, mock_create_kernel):
+        """Test BlaxelExecutor cleanup method."""
+
+        # patch manually for Python 3.10 compatibility
+        from unittest.mock import patch
+
+        mod = importlib.import_module("blaxel.core.client.api.compute")
+        create_sandbox_patcher = patch.object(mod, "create_sandbox")
+        mock_create_sandbox = create_sandbox_patcher.start()
+        delete_sandbox_patcher = patch.object(mod, "delete_sandbox")
+        mock_delete_sandbox = delete_sandbox_patcher.start()
+
+        logger = MagicMock()
+        mock_settings.headers = {}
+
+        # Mock sandbox response
+        mock_response = MagicMock()
+        mock_create_sandbox.sync.return_value = mock_response
+
+        # Mock SandboxInstance
+        mock_sandbox = MagicMock()
+        mock_metadata = MagicMock()
+        mock_metadata.url = "https://test-sandbox.bl.run"
+        mock_sandbox.metadata = mock_metadata
+        mock_sandbox_instance.return_value = mock_sandbox
+
+        # Mock kernel creation
+        mock_create_kernel.return_value = "kernel-123"
+
+        executor = BlaxelExecutor(additional_imports=[], logger=logger)
+
+        # Test cleanup
+        executor.cleanup()
+        create_sandbox_patcher.stop()
+        delete_sandbox_patcher.stop()
+
+        # Verify that delete_sandbox.sync was called
+        assert mock_delete_sandbox.sync.called
+        # Verify sandbox reference was cleaned up
+        assert not hasattr(executor, "sandbox")

@@ -17,7 +17,6 @@
 import importlib
 import json
 import os
-import re
 import tempfile
 import textwrap
 import time
@@ -25,6 +24,7 @@ import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextvars import copy_context
 from dataclasses import dataclass
 from logging import getLogger
 from pathlib import Path
@@ -57,11 +57,11 @@ from .memory import (
     SystemPromptStep,
     TaskStep,
     Timing,
-    TokenUsage,
     ToolCall,
 )
 from .models import (
     CODEAGENT_RESPONSE_FORMAT,
+    MODEL_REGISTRY,
     ChatMessage,
     ChatMessageStreamDelta,
     ChatMessageToolCall,
@@ -75,8 +75,9 @@ from .monitoring import (
     AgentLogger,
     LogLevel,
     Monitor,
+    TokenUsage,
 )
-from .remote_executors import DockerExecutor, E2BExecutor, ModalExecutor, WasmExecutor
+from .remote_executors import BlaxelExecutor, DockerExecutor, E2BExecutor, ModalExecutor, WasmExecutor
 from .tools import BaseTool, Tool, validate_tool_arguments
 from .utils import (
     AgentError,
@@ -96,11 +97,6 @@ from .utils import (
 
 
 logger = getLogger(__name__)
-
-
-def get_variable_names(self, template: str) -> set[str]:
-    pattern = re.compile(r"\{\{([^{}]+)\}\}")
-    return {match.group(1).strip() for match in pattern.finditer(template)}
 
 
 def populate_template(template: str, variables: dict[str, Any]) -> str:
@@ -290,7 +286,7 @@ class MultiStepAgent(ABC):
         provide_run_summary (`bool`, *optional*): Whether to provide a run summary when called as a managed agent.
         final_answer_checks (`list[Callable]`, *optional*): List of validation functions to run before accepting a final answer.
             Each function should:
-            - Take the final answer and the agent's memory as arguments.
+            - Take the final answer, the agent's memory, and the agent itself as arguments.
             - Return a boolean indicating whether the final answer is valid.
         return_full_result (`bool`, default `False`): Whether to return the full [`RunResult`] object or just the final answer output from the agent run.
     """
@@ -385,6 +381,7 @@ class MultiStepAgent(ABC):
                     "additional_args": {
                         "type": "object",
                         "description": "Dictionary of extra inputs to pass to the managed agent, e.g. images, dataframes, or any other contextual data it may need.",
+                        "nullable": True,
                     },
                 }
                 agent.output_type = "string"
@@ -609,17 +606,20 @@ You have been provided with these additional arguments, that you can access dire
         if not returned_final_answer and self.step_number == max_steps + 1:
             final_answer = self._handle_max_steps_reached(task)
             yield action_step
-        yield FinalAnswerStep(handle_agent_output_types(final_answer))
+        final_answer_step = FinalAnswerStep(handle_agent_output_types(final_answer))
+        self._finalize_step(final_answer_step)
+        yield final_answer_step
 
     def _validate_final_answer(self, final_answer: Any):
         for check_function in self.final_answer_checks:
             try:
-                assert check_function(final_answer, self.memory)
+                assert check_function(final_answer, self.memory, agent=self)
             except Exception as e:
                 raise AgentError(f"Check {check_function.__name__} failed with error: {e}", self.logger)
 
-    def _finalize_step(self, memory_step: ActionStep | PlanningStep):
-        memory_step.timing.end_time = time.time()
+    def _finalize_step(self, memory_step: ActionStep | PlanningStep | FinalAnswerStep):
+        if not isinstance(memory_step, FinalAnswerStep):
+            memory_step.timing.end_time = time.time()
         self.step_callbacks.callback(memory_step, agent=self)
 
     def _handle_max_steps_reached(self, task: str) -> Any:
@@ -1020,7 +1020,12 @@ You have been provided with these additional arguments, that you can access dire
         """
         # Load model
         model_info = agent_dict["model"]
-        model_class = getattr(importlib.import_module("smolagents.models"), model_info["class"])
+        model_class = MODEL_REGISTRY.get(model_info["class"])
+        if model_class is None:
+            raise ValueError(
+                f"Unknown model class '{model_info['class']}'. "
+                f"Supported models: {', '.join(sorted(MODEL_REGISTRY.keys()))}"
+            )
         model = model_class.from_dict(model_info["data"])
         # Load tools
         tools = []
@@ -1029,7 +1034,12 @@ You have been provided with these additional arguments, that you can access dire
         # Load managed agents
         managed_agents = []
         for managed_agent_dict in agent_dict["managed_agents"]:
-            agent_class = getattr(importlib.import_module("smolagents.agents"), managed_agent_dict["class"])
+            agent_class = AGENT_REGISTRY.get(managed_agent_dict["class"])
+            if agent_class is None:
+                raise ValueError(
+                    f"Unknown agent class '{managed_agent_dict['class']}'. "
+                    f"Supported agents: {', '.join(sorted(AGENT_REGISTRY.keys()))}"
+                )
             managed_agent = agent_class.from_dict(managed_agent_dict, **kwargs)
             managed_agents.append(managed_agent)
         # Extract base agent parameters
@@ -1116,11 +1126,21 @@ You have been provided with these additional arguments, that you can access dire
         # Load agent.json
         folder = Path(folder)
         agent_dict = json.loads((folder / "agent.json").read_text())
-
+        # Handle HfApiModel -> InferenceClientModel rename for old agents
+        if agent_dict.get("model", {}).get("class") == "HfApiModel":
+            agent_dict["model"]["class"] = "InferenceClientModel"
+            logger.warning(
+                "The agent you're loading uses the deprecated 'HfApiModel' class: it was automatically updated to 'InferenceClientModel'."
+            )
         # Load managed agents from their respective folders, recursively
         managed_agents = []
         for managed_agent_name, managed_agent_class_name in agent_dict["managed_agents"].items():
-            agent_cls = getattr(importlib.import_module("smolagents.agents"), managed_agent_class_name)
+            agent_cls = AGENT_REGISTRY.get(managed_agent_class_name)
+            if agent_cls is None:
+                raise ValueError(
+                    f"Unknown agent class '{managed_agent_class_name}'. "
+                    f"Supported agents: {', '.join(sorted(AGENT_REGISTRY.keys()))}"
+                )
             managed_agents.append(agent_cls.from_folder(folder / "managed_agents" / managed_agent_name))
         agent_dict["managed_agents"] = {}
 
@@ -1291,13 +1311,8 @@ class ToolCallingAgent(MultiStepAgent):
                     stop_sequences=["Observation:", "Calling tools:"],
                     tools_to_call_from=self.tools_and_managed_agents,
                 )
-                if chat_message.content is None and chat_message.raw is not None:
-                    log_content = str(chat_message.raw)
-                else:
-                    log_content = str(chat_message.content) or ""
-
                 self.logger.log_markdown(
-                    content=log_content,
+                    content=str(chat_message.content or chat_message.raw or ""),
                     title="Output message of the LLM:",
                     level=LogLevel.DEBUG,
                 )
@@ -1409,9 +1424,10 @@ class ToolCallingAgent(MultiStepAgent):
         else:
             # If multiple tool calls, process them in parallel
             with ThreadPoolExecutor(self.max_tool_threads) as executor:
-                futures = [
-                    executor.submit(process_single_tool_call, tool_call) for tool_call in parallel_calls.values()
-                ]
+                futures = []
+                for tool_call in parallel_calls.values():
+                    ctx = copy_context()
+                    futures.append(executor.submit(ctx.run, process_single_tool_call, tool_call))
                 for future in as_completed(futures):
                     tool_output = future.result()
                     outputs[tool_output.id] = tool_output
@@ -1496,7 +1512,8 @@ class CodeAgent(MultiStepAgent):
         prompt_templates ([`~agents.PromptTemplates`], *optional*): Prompt templates.
         additional_authorized_imports (`list[str]`, *optional*): Additional authorized imports for the agent.
         planning_interval (`int`, *optional*): Interval at which the agent will run a planning step.
-        executor_type (`Literal["local", "e2b", "modal", "docker", "wasm"]`, default `"local"`): Type of code executor.
+        executor ([`PythonExecutor`], *optional*): Custom Python code executor. If not provided, a default executor will be created based on `executor_type`.
+        executor_type (`Literal["local", "blaxel", "e2b", "modal", "docker", "wasm"]`, default `"local"`): Type of code executor.
         executor_kwargs (`dict`, *optional*): Additional arguments to pass to initialize the executor.
         max_print_outputs_length (`int`, *optional*): Maximum length of the print outputs.
         stream_outputs (`bool`, *optional*, default `False`): Whether to stream outputs during execution.
@@ -1514,7 +1531,8 @@ class CodeAgent(MultiStepAgent):
         prompt_templates: PromptTemplates | None = None,
         additional_authorized_imports: list[str] | None = None,
         planning_interval: int | None = None,
-        executor_type: Literal["local", "e2b", "modal", "docker", "wasm"] = "local",
+        executor: PythonExecutor = None,
+        executor_type: Literal["local", "blaxel", "e2b", "modal", "docker", "wasm"] = "local",
         executor_kwargs: dict[str, Any] | None = None,
         max_print_outputs_length: int | None = None,
         stream_outputs: bool = False,
@@ -1562,11 +1580,9 @@ class CodeAgent(MultiStepAgent):
                 "Caution: you set an authorization for all imports, meaning your agent can decide to import any package it deems necessary. This might raise issues if the package is not installed in your environment.",
                 level=LogLevel.INFO,
             )
-        if executor_type not in {"local", "e2b", "modal", "docker", "wasm"}:
-            raise ValueError(f"Unsupported executor type: {executor_type}")
         self.executor_type = executor_type
         self.executor_kwargs: dict[str, Any] = executor_kwargs or {}
-        self.python_executor = self.create_python_executor()
+        self.python_executor = executor or self.create_python_executor()
 
     def __enter__(self):
         return self
@@ -1580,6 +1596,9 @@ class CodeAgent(MultiStepAgent):
             self.python_executor.cleanup()
 
     def create_python_executor(self) -> PythonExecutor:
+        if self.executor_type not in {"local", "blaxel", "e2b", "modal", "docker", "wasm"}:
+            raise ValueError(f"Unsupported executor type: {self.executor_type}")
+
         if self.executor_type == "local":
             return LocalPythonExecutor(
                 self.additional_authorized_imports,
@@ -1589,6 +1608,7 @@ class CodeAgent(MultiStepAgent):
             if self.managed_agents:
                 raise Exception("Managed agents are not yet supported with remote code execution.")
             remote_executors = {
+                "blaxel": BlaxelExecutor,
                 "e2b": E2BExecutor,
                 "docker": DockerExecutor,
                 "wasm": WasmExecutor,
@@ -1663,7 +1683,7 @@ class CodeAgent(MultiStepAgent):
                 memory_step.model_output_message = chat_message
                 output_text = chat_message.content
                 self.logger.log_markdown(
-                    content=output_text,
+                    content=output_text or "",
                     title="Output message of the LLM:",
                     level=LogLevel.DEBUG,
                 )
@@ -1782,3 +1802,13 @@ class CodeAgent(MultiStepAgent):
         code_agent_kwargs.update(kwargs)
         # Call the parent class's from_dict method
         return super().from_dict(agent_dict, **code_agent_kwargs)
+
+
+# Agent Registry for secure deserialization
+# This registry maps agent class names to their actual classes.
+# Only classes listed here can be instantiated during deserialization (from_dict/from_folder).
+# This prevents arbitrary code execution via importlib-based dynamic loading.
+AGENT_REGISTRY = {
+    "ToolCallingAgent": ToolCallingAgent,
+    "CodeAgent": CodeAgent,
+}
