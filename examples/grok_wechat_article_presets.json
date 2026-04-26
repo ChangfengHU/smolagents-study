@@ -1,0 +1,115 @@
+{
+    "presets": [
+      {
+        "name": "AI Agent 公众号深度解读",
+        "topic": "AI Agent 如何重塑微信公众号内容生产",
+        "audience": "关注 AI 生产力、内容营销与个人品牌的中文公众号读者",
+        "tone": "专业、清晰、带一点趋势判断",
+        "section_count": 4,
+        "use_web_search": false,
+        "image_style": "premium editorial illustration, warm light, cinematic composition, modern newsroom mood, no text overlay",
+        "aspect_ratio": "16:9",
+        "resolution": "2k"
+      },
+      {
+        "name": "普通职场人 AI 提效指南",
+        "topic": "普通上班族如何用 AI 在一周内提升工作效率",
+        "audience": "想提升汇报、写作、表格整理和信息处理效率的中文职场人",
+        "tone": "通俗、务实、鼓励行动",
+        "section_count": 4,
+        "use_web_search": false,
+        "image_style": "flat illustration, bright office palette, clean shapes, modern productivity visual, no text overlay",
+        "aspect_ratio": "16:9",
+        "resolution": "2k"
+      },
+      {
+        "name": "创业者 AI 增长视角",
+        "topic": "AI 时代，小团队创业者最该重构的三种增长能力",
+        "audience": "创业者、独立开发者与小团队负责人",
+        "tone": "锐利、判断明确、偏商业洞察",
+        "section_count": 3,
+        "use_web_search": false,
+        "image_style": "cinematic business photography, dramatic contrast, startup war room atmosphere, no text overlay",
+        "aspect_ratio": "16:9",
+        "resolution": "2k"
+      },
+      {
+        "name": "热点趋势观察",
+        "topic": "2026 年最值得关注的 AI 应用趋势，会先改变谁的工作方式",
+        "audience": "想快速理解 AI 趋势和行业机会的泛科技读者",
+        "tone": "信息密度高、趋势导向、容易转发",
+        "section_count": 4,
+        "use_web_search": true,
+        "image_style": "futuristic editorial illustration, data-driven composition, sleek blue and amber lighting, no text overlay",
+        "aspect_ratio": "16:9",
+        "resolution": "2k"
+      },
+      {
+        "name": "教育场景启发",
+        "topic": "AI 会怎样改变孩子未来十年的学习方式",
+        "audience": "关注教育和未来竞争力的家长与老师",
+        "tone": "温和、前瞻、兼顾理性与情绪共鸣",
+        "section_count": 4,
+        "use_web_search": false,
+        "image_style": "soft editorial illustration, natural daylight, family and learning scenes, hopeful mood, no text overlay",
+        "aspect_ratio": "4:3",
+        "resolution": "2k"
+      },
+      {
+        "name": "个人成长升级",
+        "topic": "当 AI 能替你做很多事，一个人真正稀缺的能力还剩什么",
+        "audience": "关注成长、认知升级和长期竞争力的中文读者",
+        "tone": "有思辨感、但不故作高深",
+        "section_count": 4,
+        "use_web_search": false,
+        "image_style": "minimal editorial portrait photography, moody shadows, elegant composition, reflective atmosphere, no text overlay",
+        "aspect_ratio": "16:9",
+        "resolution": "2k"
+      },
+      {
+        "name": "新消费品牌内容打法",
+        "topic": "AI 时代，新消费品牌的内容营销为什么必须重做一遍",
+        "audience": "品牌主理人、内容运营、营销负责人",
+        "tone": "品牌感强、判断清晰、适合商业传播",
+        "section_count": 3,
+        "use_web_search": false,
+        "image_style": "high-end commercial editorial, premium product styling, soft studio light, no text overlay",
+        "aspect_ratio": "16:9",
+        "resolution": "2k"
+      },
+      {
+        "name": "城市商业观察",
+        "topic": "为什么越来越多线下门店开始用 AI 做经营决策",
+        "audience": "线下门店老板、本地生活从业者、商业观察读者",
+        "tone": "接地气、案例导向、商业逻辑清楚",
+        "section_count": 4,
+        "use_web_search": false,
+        "image_style": "documentary photography, realistic retail scenes, warm urban lighting, no text overlay",
+        "aspect_ratio": "4:3",
+        "resolution": "2k"
+      },
+      {
+        "name": "女性成长与科技",
+        "topic": "AI 工具正在悄悄改变女性表达、工作与自我实现的方式",
+        "audience": "关注成长、表达与职业发展的女性读者",
+        "tone": "温柔但有力量、细腻、现代",
+        "section_count": 4,
+        "use_web_search": false,
+        "image_style": "fashion editorial illustration, soft skin tones, elegant modern composition, confident mood, no text overlay",
+        "aspect_ratio": "4:3",
+        "resolution": "2k"
+      },
+      {
+        "name": "未来生活方式想象",
+        "topic": "如果 AI 成为每个人的第二大脑，未来生活会发生哪些具体变化",
+        "audience": "喜欢未来趋势、科技生活方式和想象力内容的读者",
+        "tone": "画面感强、可读性高、兼具启发与讨论感",
+        "section_count": 4,
+        "use_web_search": false,
+        "image_style": "speculative future lifestyle illustration, cinematic interiors, human-centered technology, no text overlay",
+        "aspect_ratio": "16:9",
+        "resolution": "2k"
+      }
+    ]
+  }
+  
