@@ -86,6 +86,30 @@ def public_result_paths(job_id: str) -> dict[str, str]:
     }
 
 
+def resolve_result_links(job_id: str, output_dir: Path | None = None) -> dict[str, str]:
+    """优先返回 article.json 里持久化的公网链接。"""
+
+    target_output_dir = output_dir or output_dir_for_job(job_id)
+    article_json = target_output_dir / "article.json"
+    if article_json.exists():
+        try:
+            payload = json.loads(article_json.read_text(encoding="utf-8"))
+            public_urls = payload.get("public_urls")
+            if isinstance(public_urls, dict) and all(isinstance(v, str) for v in public_urls.values()):
+                fallback = public_result_paths(job_id)
+                return {
+                    "article_html": public_urls.get("article_html", fallback["article_html"]),
+                    "article_markdown": public_urls.get("article_markdown", fallback["article_markdown"]),
+                    "article_json": public_urls.get("article_json", fallback["article_json"]),
+                    "draft_markdown": public_urls.get("draft_markdown", fallback["draft_markdown"]),
+                    "draft_json": public_urls.get("draft_json", fallback["draft_json"]),
+                    "output_dir": public_urls.get("output_dir", fallback["output_dir"]),
+                }
+        except (json.JSONDecodeError, OSError):
+            pass
+    return public_result_paths(job_id)
+
+
 def require_api_key(handler: BaseHTTPRequestHandler) -> bool:
     expected = os.getenv("GROK_WECHAT_API_KEY")
     if not expected:
@@ -150,6 +174,7 @@ def coerce_article_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "image_style": str,
         "aspect_ratio": str,
         "resolution": str,
+        "storage_mode": str,
     }
     options: dict[str, Any] = {"preset_index": preset_index}
     for key, expected_type in allowed_optional_fields.items():
@@ -165,6 +190,10 @@ def coerce_article_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError(f"{key} must be a boolean.")
         elif not isinstance(value, str):
             raise ValueError(f"{key} must be a string.")
+        if key == "storage_mode":
+            value = value.strip().lower()
+            if value not in {"local", "remote"}:
+                raise ValueError("storage_mode must be either 'local' or 'remote'.")
         options[key] = value
     return options
 
@@ -392,7 +421,7 @@ def run_generation_job(job_id: str, options: dict[str, Any]) -> None:
         job["updated_at"] = utc_now()
         job["finished_at"] = utc_now()
         job["result"] = {
-            **public_result_paths(job_id),
+            **(bundle.public_urls or resolve_result_links(job_id, output_dir_for_job(job_id))),
             "title": bundle.draft.title,
             "summary": bundle.draft.summary,
             "tags": bundle.draft.tags,
@@ -729,7 +758,7 @@ class GrokWechatHandler(BaseHTTPRequestHandler):
                 write_json(self, HTTPStatus.NOT_FOUND, {"error": "Result file is missing."})
                 return
             result = json.loads(article_json.read_text(encoding="utf-8"))
-            result["links"] = public_result_paths(job_id)
+            result["links"] = resolve_result_links(job_id)
             write_json(self, HTTPStatus.OK, result)
             return
         write_json(self, HTTPStatus.OK, job)
@@ -960,6 +989,13 @@ INDEX_HTML = r"""<!doctype html>
               <label for="resolution">清晰度</label>
               <input id="resolution" placeholder="1k 或 2k">
             </div>
+            <div>
+              <label for="storageMode">存储模式</label>
+              <select id="storageMode">
+                <option value="local" selected>local（Studio 内预览推荐）</option>
+                <option value="remote">remote（上传 OSS 并替换资源地址）</option>
+              </select>
+            </div>
             <label class="check-row" for="useWebSearch">
               <input id="useWebSearch" type="checkbox">
               联网补充事实
@@ -989,6 +1025,15 @@ INDEX_HTML = r"""<!doctype html>
           <h2>运行日志</h2>
           <div id="log" class="log"></div>
         </section>
+        <section style="margin-top: 18px;">
+          <h2>页面预览</h2>
+          <div id="previewHint" class="empty">生成成功后会在这里直接预览 article.html。</div>
+          <iframe
+            id="previewFrame"
+            title="article preview"
+            style="display:none;width:100%;min-height:680px;border:1px solid var(--line);border-radius:8px;background:#fff;"
+          ></iframe>
+        </section>
       </div>
     </main>
   </div>
@@ -1000,6 +1045,7 @@ INDEX_HTML = r"""<!doctype html>
     const sectionsInput = document.getElementById("sections");
     const aspectInput = document.getElementById("aspect");
     const resolutionInput = document.getElementById("resolution");
+    const storageModeInput = document.getElementById("storageMode");
     const useWebSearchInput = document.getElementById("useWebSearch");
     const styleInput = document.getElementById("style");
     const presetBriefInput = document.getElementById("presetBrief");
@@ -1017,6 +1063,8 @@ INDEX_HTML = r"""<!doctype html>
     const links = document.getElementById("links");
     const message = document.getElementById("message");
     const logBox = document.getElementById("log");
+    const previewHint = document.getElementById("previewHint");
+    const previewFrame = document.getElementById("previewFrame");
     let pollTimer = null;
     let dynamicPresetCounter = 1000;
 
@@ -1131,14 +1179,27 @@ INDEX_HTML = r"""<!doctype html>
           link.innerHTML = `${iconPath(icon)}${label}`;
           links.appendChild(link);
         });
+        if (job.result.article_html) {
+          previewFrame.src = job.result.article_html;
+          previewFrame.style.display = "block";
+          previewHint.style.display = "none";
+        }
         setBusy(false);
         if (pollTimer) clearInterval(pollTimer);
       } else if (job.status === "failed") {
         message.textContent = job.error || "生成失败。";
+        previewFrame.removeAttribute("src");
+        previewFrame.style.display = "none";
+        previewHint.style.display = "block";
+        previewHint.textContent = "生成失败，暂无可预览页面。";
         setBusy(false);
         if (pollTimer) clearInterval(pollTimer);
       } else {
         message.textContent = "任务正在运行，页面会自动刷新状态。";
+        previewFrame.removeAttribute("src");
+        previewFrame.style.display = "none";
+        previewHint.style.display = "block";
+        previewHint.textContent = "任务进行中，完成后会自动显示预览。";
         setBusy(true);
       }
     }
@@ -1161,6 +1222,7 @@ INDEX_HTML = r"""<!doctype html>
       if (sectionsInput.value.trim()) payload.sections = Number(sectionsInput.value);
       if (aspectInput.value.trim()) payload.aspect_ratio = aspectInput.value.trim();
       if (resolutionInput.value.trim()) payload.resolution = resolutionInput.value.trim();
+      if (storageModeInput.value.trim()) payload.storage_mode = storageModeInput.value.trim();
       payload.use_web_search = useWebSearchInput.checked;
       if (styleInput.value.trim()) payload.image_style = styleInput.value.trim();
 

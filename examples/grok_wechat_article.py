@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import mimetypes
 import os
 import re
 import time
@@ -40,6 +41,8 @@ DEFAULT_DOTENV_PATH = PROJECT_ROOT / ".env"
 DEFAULT_BASE_URL = "https://api.x.ai/v1"
 DEFAULT_TEXT_MODEL = "grok-4-fast-non-reasoning"
 DEFAULT_IMAGE_MODEL = "grok-imagine-image"
+DEFAULT_OSS_ENDPOINT = "http://oss-cn-hangzhou.aliyuncs.com"
+DEFAULT_OSS_BUCKET = "articel"
 
 
 class XAIAPIError(RuntimeError):
@@ -151,6 +154,8 @@ SCRIPT_TIMEOUT_SECONDS = 300
 SCRIPT_RETRY_ATTEMPTS = 2
 # SCRIPT_RETRY_BACKOFF_SECONDS: 每次重试前等待多久，后续会按次数递增。
 SCRIPT_RETRY_BACKOFF_SECONDS = 1.5
+# SCRIPT_STORAGE_MODE: 产物存储模式。local=仅本地输出，remote=上传 OSS 并替换引用。
+SCRIPT_STORAGE_MODE = os.getenv("GROK_WECHAT_STORAGE_MODE", "remote")
 # SCRIPT_OUTPUT_DIR: 输出目录。
 # 留空时，脚本会自动按“主题 + 时间戳”创建新目录。
 SCRIPT_OUTPUT_DIR = ""
@@ -246,6 +251,19 @@ class ArticleBundle:
     markdown: str
     html: str
     output_dir: str
+    public_urls: dict[str, str] | None = None
+
+
+@dataclass(frozen=True)
+class OSSConfig:
+    """阿里云 OSS 上传配置。"""
+
+    access_key_id: str
+    access_key_secret: str
+    bucket_name: str
+    endpoint: str = DEFAULT_OSS_ENDPOINT
+    key_prefix: str = "generated_articles"
+    public_base_url: str | None = None
 
 
 class XAIHttpClient:
@@ -549,9 +567,15 @@ class XAIImageGenerationTool:
 class WeChatArticleComposer:
     """总调度器：把“写文章”“生图片”“导出文件”串起来。"""
 
-    def __init__(self, text_tool: XAITextGenerationTool, image_tool: XAIImageGenerationTool):
+    def __init__(
+        self,
+        text_tool: XAITextGenerationTool,
+        image_tool: XAIImageGenerationTool,
+        oss_uploader: "OSSUploader | None" = None,
+    ):
         self.text_tool = text_tool
         self.image_tool = image_tool
+        self.oss_uploader = oss_uploader
 
     def compose(self, request: ArticleRequest, output_dir: Path) -> ArticleBundle:
         """生成整套文章包并写入输出目录。"""
@@ -602,7 +626,17 @@ class WeChatArticleComposer:
 
         # 第五步：把所有文件落盘。
         log_progress("Writing output files")
+        public_urls = None
         self._write_bundle_files(output_dir, request, draft, cover_image, section_images, markdown, html)
+        if self.oss_uploader is not None:
+            log_progress("Uploading output files to OSS")
+            public_urls = self.oss_uploader.upload_output_bundle(output_dir)
+            self._rewrite_rendered_assets_for_public_urls(output_dir, public_urls)
+            self._write_public_urls(output_dir, public_urls)
+            # article.html / article.md / article.json rewritten after first upload,
+            # so upload once more to keep OSS objects in sync with rewritten links.
+            public_urls = self.oss_uploader.upload_output_bundle(output_dir)
+            log_progress(f"OSS upload done: {public_urls['article_html']}")
         log_progress("All files written successfully")
 
         return ArticleBundle(
@@ -613,6 +647,7 @@ class WeChatArticleComposer:
             markdown=markdown,
             html=html,
             output_dir=str(output_dir),
+            public_urls=public_urls,
         )
 
     @staticmethod
@@ -655,6 +690,115 @@ class WeChatArticleComposer:
             encoding="utf-8",
         )
         (output_dir / "draft.md").write_text(render_draft_markdown(draft), encoding="utf-8")
+
+    @staticmethod
+    def _write_public_urls(output_dir: Path, public_urls: dict[str, str]) -> None:
+        """把 OSS 公网链接写入 article.json，供服务端直接返回。"""
+
+        manifest_path = output_dir / "article.json"
+        if not manifest_path.exists():
+            return
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["public_urls"] = public_urls
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    @staticmethod
+    def _rewrite_rendered_assets_for_public_urls(output_dir: Path, public_urls: dict[str, str]) -> None:
+        """将文章渲染结果里的本地图片路径替换为 OSS 公网地址。"""
+
+        images_base_url = public_urls.get("images_base_url")
+        if not images_base_url:
+            return
+
+        article_md_path = output_dir / "article.md"
+        if article_md_path.exists():
+            markdown = article_md_path.read_text(encoding="utf-8")
+            markdown = markdown.replace("(images/", f"({images_base_url}")
+            markdown = markdown.replace("](/images/", f"]({images_base_url}")
+            article_md_path.write_text(markdown, encoding="utf-8")
+
+        article_html_path = output_dir / "article.html"
+        if article_html_path.exists():
+            html = article_html_path.read_text(encoding="utf-8")
+            html = html.replace('src="images/', f'src="{images_base_url}')
+            html = html.replace("src='images/", f"src='{images_base_url}")
+            article_html_path.write_text(html, encoding="utf-8")
+
+
+class OSSUploader:
+    """上传生成产物到阿里云 OSS，并返回可直接访问的链接。"""
+
+    def __init__(self, config: OSSConfig):
+        try:
+            import oss2  # type: ignore
+        except ModuleNotFoundError as exc:
+            raise RuntimeError("oss2 is required for OSS upload. Install with: pip install oss2") from exc
+        self.oss2 = oss2
+        self.config = config
+        auth = self.oss2.Auth(config.access_key_id, config.access_key_secret)
+        self.bucket = self.oss2.Bucket(auth, config.endpoint, config.bucket_name)
+
+    def upload_output_bundle(self, output_dir: Path) -> dict[str, str]:
+        """上传文章产物目录，返回关键文件公网链接。"""
+
+        bundle_prefix = "/".join(
+            [
+                self.config.key_prefix.strip("/"),
+                output_dir.name.strip("/"),
+            ]
+        ).strip("/")
+
+        for file_path in sorted(output_dir.rglob("*")):
+            if not file_path.is_file():
+                continue
+            relative = file_path.relative_to(output_dir).as_posix()
+            object_key = f"{bundle_prefix}/{relative}"
+            self.bucket.put_object_from_file(object_key, str(file_path), headers=self._upload_headers(file_path))
+            log_progress(f"OSS uploaded: {object_key}")
+
+        return {
+            "article_html": self._public_url(f"{bundle_prefix}/article.html"),
+            "article_markdown": self._public_url(f"{bundle_prefix}/article.md"),
+            "article_json": self._public_url(f"{bundle_prefix}/article.json"),
+            "draft_markdown": self._public_url(f"{bundle_prefix}/draft.md"),
+            "draft_json": self._public_url(f"{bundle_prefix}/draft.json"),
+            "images_base_url": self._public_url(f"{bundle_prefix}/images/"),
+            "output_dir": self._public_url(f"{bundle_prefix}/"),
+        }
+
+    def _public_url(self, object_key: str) -> str:
+        if self.config.public_base_url:
+            return f"{self.config.public_base_url.rstrip('/')}/{object_key.lstrip('/')}"
+        endpoint = self.config.endpoint.strip()
+        if endpoint.startswith("http://"):
+            host = endpoint.removeprefix("http://")
+            scheme = "http"
+        elif endpoint.startswith("https://"):
+            host = endpoint.removeprefix("https://")
+            scheme = "https"
+        else:
+            host = endpoint
+            scheme = "https"
+        return f"{scheme}://{self.config.bucket_name}.{host.rstrip('/')}/{object_key.lstrip('/')}"
+
+    @staticmethod
+    def _upload_headers(file_path: Path) -> dict[str, str]:
+        """为 OSS 对象设置可预览的元数据。"""
+
+        suffix = file_path.suffix.lower()
+        if suffix == ".html":
+            content_type = "text/html; charset=utf-8"
+        elif suffix in {".md", ".markdown"}:
+            content_type = "text/markdown; charset=utf-8"
+        elif suffix == ".json":
+            content_type = "application/json; charset=utf-8"
+        else:
+            guessed = mimetypes.guess_type(file_path.name)[0]
+            content_type = guessed or "application/octet-stream"
+        headers = {"Content-Type": content_type}
+        if suffix in {".html", ".md", ".markdown", ".json", ".txt"}:
+            headers["Content-Disposition"] = "inline"
+        return headers
 
 
 def extract_response_output_text(response_payload: dict[str, Any]) -> str:
@@ -1053,6 +1197,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--aspect-ratio", default=request.aspect_ratio, help="Image aspect ratio, e.g. 16:9.")
     parser.add_argument("--resolution", default=request.resolution, help="Image resolution, e.g. 1k or 2k.")
     parser.add_argument(
+        "--storage-mode",
+        default=SCRIPT_STORAGE_MODE,
+        choices=["local", "remote"],
+        help="Artifact storage mode: local (no OSS) or remote (upload to OSS and rewrite links).",
+    )
+    parser.add_argument(
         "--api-key",
         default=SCRIPT_API_KEY or resolve_api_key(),
         help="xAI API key. Defaults to GROPK_API_KEY, GROK_API_KEY, or XAI_API_KEY.",
@@ -1079,6 +1229,7 @@ def generate_wechat_article(
     image_style: str | None = None,
     aspect_ratio: str | None = None,
     resolution: str | None = None,
+    storage_mode: str | None = None,
 ) -> ArticleBundle:
     """Generate a complete WeChat article bundle.
 
@@ -1106,6 +1257,7 @@ def generate_wechat_article(
     text_model = os.getenv("XAI_TEXT_MODEL", SCRIPT_TEXT_MODEL)
     image_model = os.getenv("XAI_IMAGE_MODEL", SCRIPT_IMAGE_MODEL)
     output_dir_value = output_dir or (Path(SCRIPT_OUTPUT_DIR) if SCRIPT_OUTPUT_DIR else None)
+    selected_storage_mode = (storage_mode or SCRIPT_STORAGE_MODE).strip().lower()
 
     # 启动时先打印关键配置，方便排查“到底连的是谁、Key 有没有读到”。
     log_progress(f"Using xAI base URL: {base_url.rstrip('/')}")
@@ -1125,6 +1277,8 @@ def generate_wechat_article(
         raise SystemExit("Missing xAI API key. Set XAI_API_KEY or pass --api-key.")
     if request.sections < 1:
         raise SystemExit("Preset section_count must be at least 1.")
+    if selected_storage_mode not in {"local", "remote"}:
+        raise SystemExit("storage_mode must be either 'local' or 'remote'.")
     # 如果你没有手写输出目录，就自动按主题创建一个新目录。
     target_output_dir = Path(output_dir_value) if output_dir_value else build_default_output_dir(selected_topic)
 
@@ -1139,9 +1293,21 @@ def generate_wechat_article(
         retry_backoff_seconds=SCRIPT_RETRY_BACKOFF_SECONDS,
     )
     client = XAIHttpClient(config)
+    oss_uploader = None
+    if selected_storage_mode == "remote":
+        oss_config = resolve_oss_config()
+        if oss_config is None:
+            raise SystemExit(
+                "storage_mode=remote requires OSS config. Set OSS_ACCESS_KEY_ID / OSS_ACCESS_KEY_SECRET / OSS_BUCKET_NAME."
+            )
+        oss_uploader = OSSUploader(oss_config)
+        log_progress(f"Storage mode: remote (OSS bucket={oss_config.bucket_name}, endpoint={oss_config.endpoint})")
+    else:
+        log_progress("Storage mode: local (skip OSS upload and URL rewrite)")
     composer = WeChatArticleComposer(
         text_tool=XAITextGenerationTool(client),
         image_tool=XAIImageGenerationTool(client),
+        oss_uploader=oss_uploader,
     )
     # 这里开始真正生成文章、图片和输出文件。
     return composer.compose(request, output_dir=target_output_dir)
@@ -1199,6 +1365,27 @@ def load_project_dotenv() -> None:
         if not key or key in os.environ:
             continue
         os.environ[key] = value.strip().strip("\"'")
+
+
+def resolve_oss_config() -> OSSConfig | None:
+    """从环境变量解析 OSS 配置，缺项时返回 None。"""
+
+    access_key_id = os.getenv("OSS_ACCESS_KEY_ID")
+    access_key_secret = os.getenv("OSS_ACCESS_KEY_SECRET")
+    bucket_name = os.getenv("OSS_BUCKET_NAME") or os.getenv("OSS_BUICTET") or DEFAULT_OSS_BUCKET
+    endpoint = os.getenv("OSS_ENDPOINT", DEFAULT_OSS_ENDPOINT)
+    key_prefix = os.getenv("OSS_KEY_PREFIX", "generated_articles")
+    public_base_url = os.getenv("OSS_PUBLIC_BASE_URL")
+    if not access_key_id or not access_key_secret or not bucket_name:
+        return None
+    return OSSConfig(
+        access_key_id=access_key_id,
+        access_key_secret=access_key_secret,
+        bucket_name=bucket_name,
+        endpoint=endpoint,
+        key_prefix=key_prefix,
+        public_base_url=public_base_url,
+    )
 
 
 if __name__ == "__main__":
