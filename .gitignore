@@ -2,6 +2,9 @@
 logs
 tmp
 wandb
+.grok_wechat_server.log
+.grok_wechat_server.pid
+.playwright-mcp/
 
 # Data
 data
@@ -147,6 +150,7 @@ archive/
 savedir/
 output/
 tool_output/
+/examples/generated_articles/
 
 # Gradio runtime
 .gradio/
