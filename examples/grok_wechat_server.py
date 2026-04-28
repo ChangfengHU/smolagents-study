@@ -12,9 +12,12 @@ Then open:
 import json
 import mimetypes
 import os
+import re
 import threading
+import time
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -32,10 +35,13 @@ CORS_ALLOW_ORIGIN = os.getenv("GROK_WECHAT_CORS_ALLOW_ORIGIN", "*")
 CORS_ALLOW_METHODS = os.getenv("GROK_WECHAT_CORS_ALLOW_METHODS", "GET, POST, HEAD, OPTIONS")
 CORS_ALLOW_HEADERS = os.getenv("GROK_WECHAT_CORS_ALLOW_HEADERS", "Content-Type, X-API-Key, Authorization")
 CORS_MAX_AGE = os.getenv("GROK_WECHAT_CORS_MAX_AGE", "86400")
+API_IO_LOG_ENABLED = os.getenv("GROK_WECHAT_API_IO_LOG", "true").lower() in {"1", "true", "yes", "on"}
+API_IO_LOG_MAX_CHARS = int(os.getenv("GROK_WECHAT_API_IO_LOG_MAX_CHARS", "4000"))
 OUTPUT_ROOT = generator.PROJECT_ROOT / "examples" / "generated_articles"
 JOB_STATE_DIR = OUTPUT_ROOT / "_jobs"
 MAX_LOG_LINES = 200
 GENERATION_LOCK = threading.Lock()
+JOB_STATE_LOCK = threading.RLock()
 
 
 def utc_now() -> str:
@@ -59,12 +65,26 @@ def load_job(job_id: str) -> dict[str, Any] | None:
     path = job_path(job_id)
     if not path.exists():
         return None
-    return json.loads(path.read_text(encoding="utf-8"))
+    last_error: Exception | None = None
+    # Under heavy concurrent logging, readers can hit a file mid-write.
+    for _ in range(3):
+        try:
+            with JOB_STATE_LOCK:
+                return json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            last_error = exc
+            time.sleep(0.02)
+    raise ValueError(f"Failed to read job state for {job_id}: {last_error}") from last_error
 
 
 def save_job(job: dict[str, Any]) -> None:
     JOB_STATE_DIR.mkdir(parents=True, exist_ok=True)
-    job_path(job["job_id"]).write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
+    target = job_path(job["job_id"])
+    temp = target.with_suffix(".json.tmp")
+    payload = json.dumps(job, ensure_ascii=False, indent=2)
+    with JOB_STATE_LOCK:
+        temp.write_text(payload, encoding="utf-8")
+        temp.replace(target)
 
 
 def append_log(job: dict[str, Any], message: str) -> None:
@@ -175,6 +195,7 @@ def coerce_article_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "aspect_ratio": str,
         "resolution": str,
         "storage_mode": str,
+        "generation_profile": str,
     }
     options: dict[str, Any] = {"preset_index": preset_index}
     for key, expected_type in allowed_optional_fields.items():
@@ -194,6 +215,10 @@ def coerce_article_payload(payload: dict[str, Any]) -> dict[str, Any]:
             value = value.strip().lower()
             if value not in {"local", "remote"}:
                 raise ValueError("storage_mode must be either 'local' or 'remote'.")
+        if key == "generation_profile":
+            value = value.strip().lower()
+            if value not in {"speed", "balanced", "quality"}:
+                raise ValueError("generation_profile must be one of: speed, balanced, quality.")
         options[key] = value
     return options
 
@@ -228,16 +253,121 @@ def preset_schema() -> dict[str, Any]:
 
 
 def clean_generated_preset(payload: dict[str, Any]) -> dict[str, Any]:
+    # Fill in missing fields with defaults
+    if not payload.get("aspect_ratio"):
+        payload["aspect_ratio"] = "16:9"
+    if not payload.get("resolution"):
+        payload["resolution"] = "2k"
+
+    # 处理 tone 可能是对象的情况
+    if isinstance(payload.get("tone"), dict):
+        # 如果 tone 是一个对象，转换成字符串描述
+        tone_obj = payload["tone"]
+        tone_parts = []
+        if "emotional_temperature" in tone_obj:
+            tone_parts.append(tone_obj["emotional_temperature"])
+        if "screen_feel" in tone_obj:
+            tone_parts.append(tone_obj["screen_feel"])
+        if "expression_style" in tone_obj:
+            tone_parts.append(tone_obj["expression_style"])
+        payload["tone"] = "、".join(tone_parts) if tone_parts else "专业、清晰"
+
     preset = asdict(generator.CreativePreset.from_dict(payload))
-    image_style = preset["image_style"].strip()
-    if "no text overlay" not in image_style.lower():
+    image_style = preset.get("image_style", "") or ""
+    image_style = image_style.strip()
+    if image_style and "no text overlay" not in image_style.lower():
         image_style = f"{image_style}, no text overlay"
+    elif not image_style:
+        image_style = "modern, professional, no text overlay"
     preset["image_style"] = image_style
     if preset["resolution"] not in {"1k", "2k"}:
         preset["resolution"] = "2k"
     if preset["aspect_ratio"] not in {"16:9", "4:3", "3:4", "1:1", "9:16"}:
         preset["aspect_ratio"] = "16:9"
+    return _ensure_chinese_preset_fields(preset)
+
+
+def _is_mostly_chinese(value: str) -> bool:
+    text = (value or "").strip()
+    if not text:
+        return False
+    cjk_count = len(re.findall(r"[\u4e00-\u9fff]", text))
+    alpha_count = len(re.findall(r"[A-Za-z]", text))
+    # 至少有中文，且中文数量不低于英文字符数量，视为“主要中文”。
+    return cjk_count > 0 and cjk_count >= alpha_count
+
+
+def _needs_chinese_rewrite(preset: dict[str, Any]) -> bool:
+    for key in ("name", "topic", "audience", "tone"):
+        if not _is_mostly_chinese(str(preset.get(key, ""))):
+            return True
+    return False
+
+
+def _ensure_chinese_preset_fields(preset: dict[str, Any]) -> dict[str, Any]:
+    """尽量保证灵感关键字段为中文（image_style 保持英文）。"""
+
+    if not _needs_chinese_rewrite(preset):
+        return preset
+
+    generator.log_progress("Preset language check: non-Chinese fields detected, starting Chinese rewrite.")
+    rewrite_prompt = (
+        "请将下面这个 JSON 预设改写为中文版本，只改写 name/topic/audience/tone 四个字段，"
+        "其他字段保持原值。要求：\n"
+        "1) name/topic/audience/tone 必须是简体中文；\n"
+        "2) image_style 必须保持英文并包含 no text overlay；\n"
+        "3) 返回且仅返回一个合法 JSON 对象，不要 markdown。\n\n"
+        f"原始 JSON：\n{json.dumps(preset, ensure_ascii=False)}"
+    )
+    try:
+        rewritten = _call_text_generation_api(
+            rewrite_prompt,
+            model_priority=[("grok", "grok-4-fast-non-reasoning"), ("vertex", "gemini-2.5-flash")],
+            race_mode=True,
+        )
+        data = json.loads(rewritten)
+        if isinstance(data, dict):
+            # 只覆盖目标字段，避免模型改坏其他结构
+            for key in ("name", "topic", "audience", "tone"):
+                if key in data and isinstance(data[key], str) and data[key].strip():
+                    preset[key] = data[key].strip()
+    except Exception as exc:  # noqa: BLE001
+        generator.log_progress(f"Chinese preset rewrite skipped due to error: {exc}")
+    # 二次兜底：如果仍有字段不是中文，逐字段强制改写，尽量保证最终输出中文。
+    for key in ("name", "topic", "audience", "tone"):
+        value = str(preset.get(key, "")).strip()
+        if not value or _is_mostly_chinese(value):
+            continue
+        forced = _rewrite_field_to_chinese(key, value, preset)
+        if forced:
+            preset[key] = forced
     return preset
+
+
+def _rewrite_field_to_chinese(field: str, value: str, preset: dict[str, Any]) -> str:
+    """将单个字段强制改写为中文，失败时返回原值。"""
+
+    prompt = (
+        f"请把下面 {field} 字段改写为简体中文，保留原意并适合微信公众号选题预设。\n"
+        "要求：\n"
+        "1) 只输出改写后的中文文本；\n"
+        "2) 不要引号，不要解释；\n"
+        "3) 语言自然，避免机器翻译腔。\n\n"
+        f"字段原文：{value}\n"
+        f"上下文topic：{preset.get('topic', '')}\n"
+        f"上下文audience：{preset.get('audience', '')}\n"
+    )
+    try:
+        text = _call_text_generation_api(
+            prompt,
+            model_priority=[("grok", "grok-4-fast-non-reasoning"), ("vertex", "gemini-2.5-flash")],
+            race_mode=False,
+        ).strip()
+        if text and _is_mostly_chinese(text):
+            return text
+    except Exception as exc:  # noqa: BLE001
+        generator.log_progress(f"Field chinese rewrite failed for {field}: {exc}")
+    return value
 
 
 def build_xai_client(timeout_seconds: int = 180) -> generator.XAIHttpClient:
@@ -270,42 +400,142 @@ def complete_creative_preset(payload: dict[str, Any]) -> dict[str, Any]:
     if not idea and not partial:
         raise ValueError("Provide idea, preset, partial, or preset fields to complete.")
 
-    client = build_xai_client()
-    response = client.post_json(
-        "/responses",
-        {
-            "model": client.config.text_model,
-            "input": [
-                {
-                    "role": "system",
-                    "content": (
-                        "You complete WeChat article creative presets for an article-and-image generation system. "
-                        "Return polished Simplified Chinese editorial fields. Keep image_style in English. "
-                        "Do not invent live facts. Use practical evergreen framing unless use_web_search is true."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        "Complete and improve this creative preset. "
-                        "Output one JSON object that exactly matches the schema.\n"
-                        f"Idea: {idea or ''}\n"
-                        f"Partial preset JSON: {json.dumps(partial, ensure_ascii=False)}"
-                    ),
-                },
-            ],
-            "text": {
-                "format": {
-                    "type": "json_schema",
-                    "name": "creative_preset",
-                    "schema": preset_schema(),
-                    "strict": True,
-                }
-            },
-        },
-    )
-    data = json.loads(generator.extract_response_output_text(response))
+    system_prompt = """你是微信公众号选题与栏目策划总监。你的任务是把不完整创意预设补全成“可直接投产”的高质量预设。
+
+高质量标准（必须同时满足）：
+1. 保持原始创意方向，不偏题；优先保留用户已给信息。
+2. topic 必须具体到可写（不是口号），应包含明确场景/冲突/价值点。
+3. audience 必须是可识别人群（身份 + 阶段 + 核心诉求），避免“泛人群”。
+4. tone 要能指导写作风格，包含至少两个维度（如情绪温度、叙事方式、表达节奏）。
+5. section_count 以 3-4 为优先，除非题材明显需要更多结构。
+6. image_style 必须是英文、可视化、可执行，且强制包含 "no text overlay"。
+7. 所有字段之间要互相一致：topic、audience、tone、image_style 不能冲突。
+8. 只输出一个 JSON 对象，不要 markdown、不要解释、不要注释。"""
+
+    partial_str = json.dumps(partial, ensure_ascii=False, indent=2)
+    user_prompt = f"""请补全并改进下面的创意预设，使其达到可直接用于文章生成的质量：
+
+{"当前想法：" + idea if idea else ""}
+
+{"当前预设（不完整）：" + partial_str if partial else ""}
+
+要求：
+- 返回一个完整 JSON 对象，字段必须且仅包含：
+  name, topic, audience, tone, section_count, use_web_search, image_style, aspect_ratio, resolution
+- name：12字以内，突出差异化定位，不要泛词（如“优质内容”）
+- topic：一句话写清主问题 + 受众收益，避免空泛
+- audience：越具体越好（如“8-12岁孩子家长，担心学习内驱力不足”）
+- tone：给出可执行的表达风格，不要抽象词堆砌
+- image_style：英文、具体、包含 "no text overlay"，避免空泛形容词
+- aspect_ratio 仅可为：16:9, 4:3, 3:4, 1:1, 9:16
+- resolution 仅可为：1k 或 2k
+- section_count 范围 1-8，优先 3 或 4
+- 返回纯 JSON，不要代码块，不要任何解释文本"""
+
+    prompt_to_send = f"{system_prompt}\n\n{user_prompt}"
+
+    generator.log_progress("Completing creative preset (racing all models)...")
+    # 使用竞速模式加快补全速度
+    response_text = _call_text_generation_api(prompt_to_send, race_mode=True)
+
+    try:
+        data = json.loads(response_text)
+    except json.JSONDecodeError:
+        # 尝试从markdown代码块中提取
+        if "```json" in response_text:
+            json_str = response_text.split("```json")[1].split("```")[0].strip()
+            data = json.loads(json_str)
+        elif "```" in response_text:
+            json_str = response_text.split("```")[1].split("```")[0].strip()
+            data = json.loads(json_str)
+        else:
+            raise ValueError(f"Response was not valid JSON: {response_text[:500]}")
+
     return clean_generated_preset(data)
+
+
+def _call_text_generation_api(prompt: str, model_priority: list[tuple[str, str]] | None = None, race_mode: bool = False) -> str:
+    """调用高质量文本生成接口，支持竞速或降级模式。
+
+    Args:
+        prompt: 提示词
+        model_priority: [(provider, model), ...] 优先级列表
+        race_mode: True 为竞速模式（并发所有模型），False 为降级模式（顺序尝试）
+
+    Returns:
+        生成的文本内容
+    """
+    if model_priority is None:
+        # 默认优先级：快速模型优先
+        model_priority = [
+            ("grok", "grok-4-fast-non-reasoning"),
+            ("grok", "grok-4-fast-reasoning"),
+            ("grok", "grok-4-0709"),
+            ("grok", "grok-3"),
+        ]
+
+    import requests
+
+    def call_single_model(provider: str, model: str) -> tuple[bool, str, str]:
+        """调用单个模型，返回 (成功, 文本或错误, 模型名)"""
+        try:
+            payload = {
+                "provider": provider,
+                "model": model,
+                "prompt": prompt,
+            }
+            response = requests.post(
+                "https://images.vyibc.com/api/v1beta/text:generate",
+                json=payload,
+                timeout=240,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            if "error" in data:
+                error_msg = data.get("error", {}).get("message", "Unknown error")
+                return False, error_msg, f"{provider}/{model}"
+
+            text = data.get("text", "").strip()
+            if text:
+                return True, text, f"{provider}/{model}"
+            else:
+                return False, "Empty response", f"{provider}/{model}"
+        except Exception as e:
+            return False, str(e), f"{provider}/{model}"
+
+    # 竞速模式：并发请求所有模型，返回最快的
+    if race_mode:
+        generator.log_progress(f"Racing {len(model_priority)} models in parallel...")
+        with ThreadPoolExecutor(max_workers=len(model_priority)) as executor:
+            futures = {
+                executor.submit(call_single_model, provider, model): (provider, model)
+                for provider, model in model_priority
+            }
+
+            for future in as_completed(futures):
+                success, result, model_name = future.result()
+                if success:
+                    generator.log_progress(f"✓ Fastest model: {model_name}")
+                    return result
+
+        # 所有模型都失败了
+        raise RuntimeError("All models failed in race mode")
+
+    # 降级模式：顺序尝试模型
+    else:
+        last_error = None
+        for provider, model in model_priority:
+            success, result, model_name = call_single_model(provider, model)
+            if success:
+                if (provider, model) != model_priority[0]:
+                    generator.log_progress(f"Using fallback model {model_name}")
+                return result
+            else:
+                generator.log_progress(f"Model {model_name} failed: {result}, trying next...")
+                last_error = result
+
+        raise RuntimeError(f"All text generation models failed. Last error: {last_error}")
 
 
 def generate_creative_presets(payload: dict[str, Any]) -> dict[str, Any]:
@@ -321,55 +551,72 @@ def generate_creative_presets(payload: dict[str, Any]) -> dict[str, Any]:
         for key in ("audience", "tone", "use_web_search", "image_style", "aspect_ratio", "resolution")
         if key in payload
     }
-    client = build_xai_client(timeout_seconds=240)
-    response = client.post_json(
-        "/responses",
-        {
-            "model": client.config.text_model,
-            "input": [
-                {
-                    "role": "system",
-                    "content": (
-                        "You design diverse WeChat article creative presets for an article-and-image generation system. "
-                        "Return polished Simplified Chinese preset names, topics, audiences, and tones. "
-                        "Keep image_style in English and include 'no text overlay'. "
-                        "Each preset should be specific enough to generate a strong article package."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"Generate {count} creative presets from this brief:\n{brief.strip()}\n"
-                        f"Optional defaults or constraints: {json.dumps(defaults, ensure_ascii=False)}"
-                    ),
-                },
-            ],
-            "text": {
-                "format": {
-                    "type": "json_schema",
-                    "name": "creative_preset_list",
-                    "schema": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "required": ["presets"],
-                        "properties": {
-                            "presets": {
-                                "type": "array",
-                                "minItems": count,
-                                "maxItems": count,
-                                "items": preset_schema(),
-                            }
-                        },
-                    },
-                    "strict": True,
-                }
-            },
-        },
-    )
-    data = json.loads(generator.extract_response_output_text(response))
+
+    system_prompt = """你是微信公众号内容策略负责人。你的目标是产出“可直接开写”的高质量创意预设集合。
+
+核心要求：
+1. 质量优先：每个预设都要完整、具体、可执行，避免空话和套话。
+2. 差异化优先：预设之间必须显著不同，至少覆盖不同读者细分、叙事角度、价值主张。
+3. 传播性优先：topic 需要兼顾点击动机与阅读价值，避免标题党。
+4. 一致性：name/topic/audience/tone/section_count/image_style 必须前后一致，不冲突。
+5. 结构控制：section_count 推荐 3-4；仅在必要时提高。
+6. 视觉可执行：image_style 必须是英文，并包含 "no text overlay"。
+
+输出约束：
+- 只输出一个 JSON 对象，形如 {"presets":[...]}
+- 不允许输出 markdown、解释、注释或额外字段。"""
+
+    user_prompt = f"""基于以下创意简报，生成 {count} 个高质量且彼此明显不同的 WeChat 文章创意预设：
+
+创意简报：
+{brief.strip()}
+
+{'当前偏好设置：' + json.dumps(defaults, ensure_ascii=False) if defaults else ''}
+
+要求：
+- 生成 {count} 个预设；每个预设必须包含：
+  name, topic, audience, tone, section_count, use_web_search, image_style, aspect_ratio, resolution
+- 各预设必须在以下至少两项上明显不同：目标读者、切入角度、叙事方式、行动导向
+- name：简短有辨识度（不超过 12 字，避免重复词）
+- topic：具体到可写，体现“问题场景 + 价值收益”
+- audience：精准细分，不得写“所有人/大众”
+- tone：可执行（如“温暖叙事 + 数据点穿插 + 行动清单收束”）
+- section_count：1-8，优先 3 或 4
+- image_style：英文且包含 "no text overlay"
+- aspect_ratio：16:9 / 4:3 / 3:4 / 1:1 / 9:16
+- resolution：1k 或 2k
+- 仅返回 JSON 对象，不要代码块和解释文本"""
+
+    prompt_to_send = f"{system_prompt}\n\n用户请求：\n{user_prompt}"
+
+    # 调用高质量文本生成API，获取创意预设
+    # 预设生成使用竞速模式，哪个模型最快就用哪个
+    generator.log_progress(f"Generating {count} creative presets (racing all models for speed)...")
+
+    # 为预设生成使用竞速模式，同时请求所有模型
+    response_text = _call_text_generation_api(prompt_to_send, race_mode=True)
+
+    try:
+        # 从响应中提取JSON
+        data = json.loads(response_text)
+    except json.JSONDecodeError:
+        # 如果直接不是JSON，尝试从markdown代码块中提取
+        if "```json" in response_text:
+            json_str = response_text.split("```json")[1].split("```")[0].strip()
+            data = json.loads(json_str)
+        elif "```" in response_text:
+            json_str = response_text.split("```")[1].split("```")[0].strip()
+            data = json.loads(json_str)
+        else:
+            raise ValueError(f"Response was not valid JSON: {response_text[:500]}")
+
     presets = data.get("presets")
     if not isinstance(presets, list):
-        raise ValueError("Model response did not contain presets.")
+        raise ValueError(f"Model response did not contain presets array. Got: {data}")
+
+    if len(presets) < count:
+        generator.log_progress(f"Warning: Expected {count} presets but got {len(presets)}")
+
     return {"presets": [clean_generated_preset(item) for item in presets]}
 
 
@@ -452,6 +699,31 @@ def write_json(handler: BaseHTTPRequestHandler, status: HTTPStatus, payload: dic
     handler.wfile.write(body)
 
 
+def _safe_json_dumps(data: Any) -> str:
+    try:
+        return json.dumps(data, ensure_ascii=False)
+    except Exception:  # noqa: BLE001
+        return repr(data)
+
+
+def _truncate_text(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars]}...<truncated {len(text) - max_chars} chars>"
+
+
+def log_api_io(path: str, request_payload: Any, response_status: HTTPStatus, response_payload: Any) -> None:
+    """打印接口入参/出参日志，便于线上排查。"""
+
+    if not API_IO_LOG_ENABLED:
+        return
+    req_text = _truncate_text(_safe_json_dumps(request_payload), API_IO_LOG_MAX_CHARS)
+    res_text = _truncate_text(_safe_json_dumps(response_payload), API_IO_LOG_MAX_CHARS)
+    generator.log_progress(
+        f"API_IO path={path} status={int(response_status)} request={req_text} response={res_text}"
+    )
+
+
 def write_text(handler: BaseHTTPRequestHandler, status: HTTPStatus, body: str, content_type: str) -> None:
     raw = body.encode("utf-8")
     handler.send_response(status)
@@ -505,7 +777,8 @@ def list_jobs() -> list[dict[str, Any]]:
     jobs = []
     for path in sorted(JOB_STATE_DIR.glob("*.json"), reverse=True):
         try:
-            jobs.append(json.loads(path.read_text(encoding="utf-8")))
+            with JOB_STATE_LOCK:
+                jobs.append(json.loads(path.read_text(encoding="utf-8")))
         except json.JSONDecodeError:
             continue
     return jobs
@@ -664,6 +937,9 @@ class GrokWechatHandler(BaseHTTPRequestHandler):
         if path == "/":
             write_text(self, HTTPStatus.OK, INDEX_HTML, "text/html; charset=utf-8")
             return
+        if path == "/ui":
+            write_text(self, HTTPStatus.OK, NEW_UI_HTML, "text/html; charset=utf-8")
+            return
         if path == "/docs":
             write_text(self, HTTPStatus.OK, render_docs_html(self), "text/html; charset=utf-8")
             return
@@ -723,21 +999,33 @@ class GrokWechatHandler(BaseHTTPRequestHandler):
             return
         if not require_api_key(self):
             return
+        payload: dict[str, Any] | None = None
         try:
             payload = parse_json_body(self)
             if path == "/api/articles":
                 job = start_generation_job(payload)
+                log_api_io(path, payload, HTTPStatus.ACCEPTED, job)
                 write_json(self, HTTPStatus.ACCEPTED, job)
             elif path == "/api/presets/complete":
-                write_json(self, HTTPStatus.OK, {"preset": complete_creative_preset(payload)})
+                response_payload = {"preset": complete_creative_preset(payload)}
+                log_api_io(path, payload, HTTPStatus.OK, response_payload)
+                write_json(self, HTTPStatus.OK, response_payload)
             else:
-                write_json(self, HTTPStatus.OK, generate_creative_presets(payload))
+                response_payload = generate_creative_presets(payload)
+                log_api_io(path, payload, HTTPStatus.OK, response_payload)
+                write_json(self, HTTPStatus.OK, response_payload)
         except ValueError as exc:
-            write_json(self, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            response_payload = {"error": str(exc)}
+            log_api_io(path, payload, HTTPStatus.BAD_REQUEST, response_payload)
+            write_json(self, HTTPStatus.BAD_REQUEST, response_payload)
         except json.JSONDecodeError:
-            write_json(self, HTTPStatus.BAD_REQUEST, {"error": "Invalid JSON body."})
+            response_payload = {"error": "Invalid JSON body."}
+            log_api_io(path, payload, HTTPStatus.BAD_REQUEST, response_payload)
+            write_json(self, HTTPStatus.BAD_REQUEST, response_payload)
         except generator.XAIAPIError as exc:
-            write_json(self, HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
+            response_payload = {"error": str(exc)}
+            log_api_io(path, payload, HTTPStatus.BAD_GATEWAY, response_payload)
+            write_json(self, HTTPStatus.BAD_GATEWAY, response_payload)
 
     def handle_job_get(self, path: str) -> None:
         parts = [part for part in path.split("/") if part]
@@ -996,6 +1284,14 @@ INDEX_HTML = r"""<!doctype html>
                 <option value="remote">remote（上传 OSS 并替换资源地址）</option>
               </select>
             </div>
+            <div>
+              <label for="generationProfile">生成策略</label>
+              <select id="generationProfile">
+                <option value="speed">速度优先（更快返回）</option>
+                <option value="balanced" selected>均衡（默认）</option>
+                <option value="quality">质量优先（更高质量）</option>
+              </select>
+            </div>
             <label class="check-row" for="useWebSearch">
               <input id="useWebSearch" type="checkbox">
               联网补充事实
@@ -1046,6 +1342,7 @@ INDEX_HTML = r"""<!doctype html>
     const aspectInput = document.getElementById("aspect");
     const resolutionInput = document.getElementById("resolution");
     const storageModeInput = document.getElementById("storageMode");
+    const generationProfileInput = document.getElementById("generationProfile");
     const useWebSearchInput = document.getElementById("useWebSearch");
     const styleInput = document.getElementById("style");
     const presetBriefInput = document.getElementById("presetBrief");
@@ -1223,6 +1520,7 @@ INDEX_HTML = r"""<!doctype html>
       if (aspectInput.value.trim()) payload.aspect_ratio = aspectInput.value.trim();
       if (resolutionInput.value.trim()) payload.resolution = resolutionInput.value.trim();
       if (storageModeInput.value.trim()) payload.storage_mode = storageModeInput.value.trim();
+      if (generationProfileInput.value.trim()) payload.generation_profile = generationProfileInput.value.trim();
       payload.use_web_search = useWebSearchInput.checked;
       if (styleInput.value.trim()) payload.image_style = styleInput.value.trim();
 
@@ -1326,17 +1624,20 @@ DOCS_HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Grok WeChat Article API Docs</title>
+  <title>Grok WeChat Article Studio</title>
   <style>
     :root {
-      color-scheme: light;
-      --bg: #f7f8f5;
+      --bg: #f5f7f4;
       --surface: #ffffff;
       --ink: #17211c;
       --muted: #5f6d66;
       --line: #d9e0dc;
       --accent: #0e7c66;
+      --accent-strong: #0a6b5b;
       --accent-soft: #e3f0eb;
+      --good: #0e7c66;
+      --warn: #cc8800;
+      --bad: #c9302c;
       --code-bg: #101b17;
       --code-ink: #d7eee4;
     }
@@ -1345,82 +1646,378 @@ DOCS_HTML = r"""<!doctype html>
       margin: 0;
       background: var(--bg);
       color: var(--ink);
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", sans-serif;
       letter-spacing: 0;
+      line-height: 1.6;
     }
-    .shell { max-width: 1080px; margin: 0 auto; padding: 30px 18px 48px; }
-    header { display: flex; justify-content: space-between; gap: 18px; align-items: flex-start; padding-bottom: 22px; border-bottom: 1px solid var(--line); }
-    h1 { margin: 0; font-size: 30px; line-height: 1.15; }
-    h2 { margin: 28px 0 12px; font-size: 20px; }
-    h3 { margin: 0 0 10px; font-size: 16px; }
-    p { color: var(--muted); line-height: 1.7; margin: 8px 0 0; }
-    a { color: var(--accent); font-weight: 700; text-decoration: none; }
+    .shell { max-width: 1440px; margin: 0 auto; padding: 20px 16px; }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 20px;
+      padding-bottom: 20px;
+      border-bottom: 1px solid var(--line);
+      margin-bottom: 20px;
+    }
+    h1 { margin: 0; font-size: 28px; font-weight: 700; }
+    h2 { margin: 0 0 12px; font-size: 16px; font-weight: 600; }
+    h3 { margin: 0 0 10px; font-size: 14px; font-weight: 600; }
+    h4 { margin: 8px 0; font-size: 13px; font-weight: 600; }
+    p { margin: 0; color: var(--muted); }
+    a { color: var(--accent); text-decoration: none; }
     a:hover { text-decoration: underline; }
-    .button {
-      display: inline-flex;
+
+    /* 流程进度条 */
+    .process-bar {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 16px;
+      padding: 20px;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      margin-bottom: 20px;
+    }
+    .step {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      position: relative;
+    }
+    .step-dot {
+      width: 44px;
+      height: 44px;
+      border-radius: 50%;
+      background: #f0f4f1;
+      border: 2px solid var(--line);
+      display: flex;
       align-items: center;
       justify-content: center;
-      min-height: 40px;
-      border-radius: 7px;
-      border: 1px solid #cfe1da;
-      padding: 9px 13px;
-      background: var(--accent-soft);
-      color: #095f4f;
-      text-decoration: none;
-      white-space: nowrap;
+      font-weight: 700;
+      color: var(--muted);
+      font-size: 16px;
+      transition: all 0.3s ease;
+      margin-bottom: 8px;
     }
-    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
-    .card {
+    .step.active .step-dot {
+      background: var(--accent);
+      color: white;
+      border-color: var(--accent);
+    }
+    .step.done .step-dot {
+      background: var(--accent);
+      color: white;
+      border-color: var(--accent);
+    }
+    .step-label {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--ink);
+      text-align: center;
+      margin-bottom: 4px;
+    }
+    .step-time {
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    /* 主布局 */
+    main {
+      display: grid;
+      grid-template-columns: 380px 1fr;
+      gap: 20px;
+    }
+    .panel {
       background: var(--surface);
       border: 1px solid var(--line);
       border-radius: 8px;
       padding: 18px;
-      margin-top: 14px;
     }
-    .method {
-      display: inline-block;
-      min-width: 54px;
-      border-radius: 6px;
-      padding: 4px 8px;
-      background: var(--accent-soft);
-      color: #095f4f;
+    .panel-section {
+      margin-bottom: 20px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid var(--line);
+    }
+    .panel-section:last-child {
+      border-bottom: none;
+      margin-bottom: 0;
+      padding-bottom: 0;
+    }
+
+    /* 表单元素 */
+    label {
+      display: block;
+      margin-top: 10px;
       font-size: 12px;
-      font-weight: 800;
-      text-align: center;
-      margin-right: 8px;
+      color: var(--muted);
+      font-weight: 600;
     }
-    code, pre {
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    label:first-child { margin-top: 0; }
+    input, select, textarea {
+      width: 100%;
+      margin-top: 6px;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fbfcfa;
+      color: var(--ink);
+      font: inherit;
       font-size: 13px;
     }
-    code { background: #edf3f0; padding: 2px 5px; border-radius: 5px; color: #143a31; }
-    pre {
-      margin: 12px 0 0;
-      padding: 14px;
-      overflow: auto;
-      border-radius: 8px;
-      background: var(--code-bg);
-      color: var(--code-ink);
-      line-height: 1.55;
+    textarea {
+      resize: vertical;
+      min-height: 80px;
     }
-    table {
+    input:focus, select:focus, textarea:focus {
+      outline: none;
+      border-color: var(--accent);
+      background: #fff;
+    }
+
+    /* 按钮 */
+    button {
       width: 100%;
-      border-collapse: collapse;
-      margin-top: 12px;
+      padding: 10px 14px;
+      margin-top: 10px;
+      border: none;
+      border-radius: 6px;
+      font-weight: 600;
+      font-size: 13px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      transition: all 0.2s ease;
+    }
+    button.primary {
+      background: var(--accent);
+      color: white;
+    }
+    button.primary:hover {
+      background: var(--accent-strong);
+    }
+    button.secondary {
+      background: var(--accent-soft);
+      color: var(--accent-strong);
+      border: 1px solid #cfe1da;
+    }
+    button.secondary:hover {
+      background: #d9e9e3;
+    }
+    button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+
+    /* 网格和行 */
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+
+    /* 右侧内容区 */
+    .content-area {
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    /* Tab 面板 */
+    .tabs {
+      display: flex;
+      gap: 0;
       background: var(--surface);
       border: 1px solid var(--line);
       border-radius: 8px;
       overflow: hidden;
     }
-    th, td { padding: 11px 12px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; line-height: 1.55; }
-    th { background: #f0f4f1; font-size: 13px; color: #33433c; }
-    tr:last-child td { border-bottom: 0; }
-    .note { border-left: 4px solid var(--accent); padding: 12px 14px; background: var(--accent-soft); border-radius: 6px; color: #20483e; }
-    @media (max-width: 760px) {
+    .tab-button {
+      flex: 1;
+      padding: 12px 14px;
+      background: transparent;
+      border: none;
+      border-bottom: 2px solid transparent;
+      color: var(--muted);
+      font-weight: 600;
+      cursor: pointer;
+      text-align: center;
+      margin: 0;
+      border-radius: 0;
+    }
+    .tab-button.active {
+      color: var(--accent);
+      border-bottom-color: var(--accent);
+      background: #fbfcfa;
+    }
+    .tab-content {
+      padding: 18px;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 0 0 8px 8px;
+      border-top: none;
+      margin-top: -1px;
+      display: none;
+    }
+    .tab-content.active {
+      display: block;
+    }
+
+    /* 指标卡片 */
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .metric {
+      background: #fbfcfa;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 12px;
+    }
+    .metric-label {
+      font-size: 11px;
+      color: var(--muted);
+      font-weight: 600;
+      margin-bottom: 6px;
+    }
+    .metric-value {
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--ink);
+      word-break: break-all;
+    }
+
+    /* 预设卡片 */
+    .presets-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+      gap: 12px;
+    }
+    .preset-card {
+      border: 2px solid var(--line);
+      border-radius: 6px;
+      padding: 12px;
+      cursor: pointer;
+      transition: all 0.2s;
+      background: #fbfcfa;
+    }
+    .preset-card:hover {
+      border-color: var(--accent);
+    }
+    .preset-card.selected {
+      border-color: var(--accent);
+      background: var(--accent-soft);
+    }
+    .preset-card-name {
+      font-weight: 600;
+      font-size: 13px;
+      margin-bottom: 8px;
+    }
+    .preset-card-info {
+      font-size: 11px;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+
+    /* Draft 预览 */
+    .draft-preview {
+      background: #fbfcfa;
+      padding: 16px;
+      border-radius: 6px;
+      max-height: 400px;
+      overflow-y: auto;
+    }
+    .draft-title {
+      font-size: 18px;
+      font-weight: 700;
+      margin-bottom: 6px;
+    }
+    .draft-subtitle {
+      font-size: 14px;
+      color: var(--muted);
+      margin-bottom: 12px;
+    }
+    .draft-summary {
+      font-size: 12px;
+      color: var(--muted);
+      font-style: italic;
+      padding: 10px;
+      background: white;
+      border-left: 3px solid var(--accent);
+      margin-bottom: 12px;
+      border-radius: 4px;
+    }
+    .draft-section {
+      margin-bottom: 14px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--line);
+    }
+    .draft-section:last-child {
+      border-bottom: none;
+    }
+    .draft-section h4 {
+      margin-bottom: 6px;
+    }
+    .draft-section p {
+      margin: 4px 0;
+      font-size: 12px;
+    }
+    .draft-section ul {
+      margin: 6px 0;
+      padding-left: 18px;
+    }
+    .draft-section li {
+      font-size: 12px;
+      margin: 2px 0;
+    }
+    .draft-stats {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    /* 日志 */
+    .log {
+      background: #111c18;
+      color: #d7eee4;
+      padding: 12px;
+      border-radius: 6px;
+      font-family: "SF Mono", Monaco, "Cascadia Code", "Roboto Mono", Consolas, monospace;
+      font-size: 11px;
+      line-height: 1.5;
+      max-height: 300px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .log-line { margin: 2px 0; }
+
+    /* 工具栏 */
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 12px;
+    }
+    .toolbar button {
+      flex: 1;
+      min-width: 120px;
+      margin: 0;
+      padding: 8px 12px;
+      font-size: 12px;
+    }
+
+    /* 响应式 */
+    @media (max-width: 1024px) {
+      main { grid-template-columns: 1fr; }
+      .metrics { grid-template-columns: repeat(2, 1fr); }
+    }
+    @media (max-width: 640px) {
       header { display: block; }
-      .button { margin-top: 14px; }
-      .grid { grid-template-columns: 1fr; }
-      table { display: block; overflow-x: auto; }
+      .process-bar { grid-template-columns: repeat(2, 1fr); }
+      .row { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -1428,489 +2025,1348 @@ DOCS_HTML = r"""<!doctype html>
   <div class="shell">
     <header>
       <div>
-        <h1>Grok WeChat Article API Docs</h1>
-        <p>通过 HTTP 创建公众号文章生成任务、查询进度，并获取生成后的 Markdown、HTML、JSON 和图片资源。</p>
+        <h1>✨ Grok WeChat Article Studio</h1>
+        <p style="margin-top: 4px;">AI 驱动的公众号文章生成系统 — <a href="/docs" target="_blank">查看 API 文档</a></p>
       </div>
-      <a class="button" href="/">返回控制台</a>
+      <div style="font-size: 18px; font-weight: 700; color: var(--muted);" id="statusBadge">准备就绪</div>
     </header>
 
-    <section>
-      <h2>基础信息</h2>
-      <div class="grid">
-        <div class="card">
-          <h3>Base URL</h3>
-          <pre>http://127.0.0.1:8765</pre>
+    <!-- 流程进度条 -->
+    <div class="process-bar" id="processBar" style="display: none;">
+      <div class="step active" id="step1">
+        <div class="step-dot">1</div>
+        <div class="step-label">预设生成</div>
+        <div class="step-time" id="step1Time"></div>
+      </div>
+      <div class="step" id="step2">
+        <div class="step-dot">2</div>
+        <div class="step-label">文章草稿</div>
+        <div class="step-time" id="step2Time"></div>
+      </div>
+      <div class="step" id="step3">
+        <div class="step-dot">3</div>
+        <div class="step-label">图片生成</div>
+        <div class="step-time" id="step3Time"></div>
+      </div>
+      <div class="step" id="step4">
+        <div class="step-dot">4</div>
+        <div class="step-label">完成</div>
+        <div class="step-time" id="step4Time"></div>
+      </div>
+    </div>
+
+    <!-- 主体布局 -->
+    <main>
+      <!-- 左侧：配置面板 -->
+      <div class="panel">
+        <h2>生成配置</h2>
+
+        <div class="panel-section">
+          <h3>灵感池</h3>
+          <label>当前灵感</label>
+          <select id="preset"></select>
+
+          <label for="presetBrief">换一批方向</label>
+          <textarea id="presetBrief" placeholder="例如：面向家长的AI教育公众号选题"></textarea>
+
+          <label style="margin-top: 10px;">数量</label>
+          <input id="presetCount" type="number" min="1" max="10" value="5" placeholder="1-10">
+
+          <button class="secondary" id="generatePresets" type="button">
+            <span>🔄 换一批灵感</span>
+          </button>
         </div>
-        <div class="card">
-          <h3>鉴权</h3>
-          <p>默认不启用接口鉴权。设置环境变量 <code>GROK_WECHAT_API_KEY</code> 后，创建任务接口需要请求头 <code>X-API-Key</code>。</p>
+
+        <div class="panel-section">
+          <h3>指定创意</h3>
+          <label for="completeIdea">创意描述</label>
+          <textarea id="completeIdea" placeholder="例如：未来生活方式想象"></textarea>
+          <button class="secondary" id="completePreset" type="button">
+            <span>✓ 完成创意</span>
+          </button>
+        </div>
+
+        <div class="panel-section">
+          <h3>文章设定</h3>
+          <label for="topic">主题</label>
+          <textarea id="topic" placeholder="自动填入或编辑"></textarea>
+
+          <label for="audience">目标读者</label>
+          <textarea id="audience" placeholder="自动填入或编辑"></textarea>
+
+          <label for="tone">语气</label>
+          <input id="tone" placeholder="自动填入或编辑">
+
+          <div class="row">
+            <div>
+              <label for="sections">小节数</label>
+              <input id="sections" type="number" min="1" max="8" placeholder="3-4">
+            </div>
+            <div>
+              <label for="aspect">图片比例</label>
+              <select id="aspect">
+                <option value="">自动</option>
+                <option value="16:9">16:9</option>
+                <option value="4:3">4:3</option>
+                <option value="1:1">1:1</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="row">
+            <div>
+              <label for="resolution">清晰度</label>
+              <select id="resolution">
+                <option value="">自动</option>
+                <option value="1k">1K</option>
+                <option value="2k">2K</option>
+              </select>
+            </div>
+            <div>
+              <label for="storageMode">存储模式</label>
+              <select id="storageMode">
+                <option value="local">本地预览</option>
+                <option value="remote">上传OSS</option>
+              </select>
+            </div>
+            <div>
+              <label for="generationProfile">生成策略</label>
+              <select id="generationProfile">
+                <option value="speed">速度优先</option>
+                <option value="balanced" selected>均衡</option>
+                <option value="quality">质量优先</option>
+              </select>
+            </div>
+          </div>
+
+          <label class="checkbox">
+            <input id="useWebSearch" type="checkbox">
+            <span style="color: var(--ink); margin-left: 4px;">联网补充事实</span>
+          </label>
+
+          <label for="style">视觉风格</label>
+          <textarea id="style" placeholder="自动填入或编辑"></textarea>
+        </div>
+
+        <button class="primary" id="generate" type="button">
+          <span>▶️ 开始生成</span>
+        </button>
+      </div>
+
+      <!-- 右侧：内容区 -->
+      <div class="content-area">
+        <!-- 预设和草稿的Tab页 -->
+        <div>
+          <div class="tabs">
+            <button class="tab-button active" data-tab="result">任务结果</button>
+            <button class="tab-button" data-tab="presets">预设对比</button>
+            <button class="tab-button" data-tab="draft">文章草稿</button>
+            <button class="tab-button" data-tab="logs">运行日志</button>
+          </div>
+
+          <!-- Tab: 任务结果 -->
+          <div class="tab-content active" id="result-tab">
+            <div class="metrics">
+              <div class="metric">
+                <div class="metric-label">任务 ID</div>
+                <div class="metric-value" id="jobId" style="font-size: 12px;">-</div>
+              </div>
+              <div class="metric">
+                <div class="metric-label">状态</div>
+                <div class="metric-value" id="jobStatus" style="font-size: 13px;">-</div>
+              </div>
+              <div class="metric">
+                <div class="metric-label">标题</div>
+                <div class="metric-value" id="title" style="font-size: 12px;">-</div>
+              </div>
+              <div class="metric">
+                <div class="metric-label">图片数</div>
+                <div class="metric-value" id="imageCount">-</div>
+              </div>
+            </div>
+
+            <div id="message" class="empty" style="text-align: center; padding: 40px 20px;">
+              👈 选择灵感，点击"开始生成"
+            </div>
+
+            <div id="links" class="toolbar" style="display: none;"></div>
+          </div>
+
+          <!-- Tab: 预设对比 -->
+          <div class="tab-content" id="presets-tab">
+            <div id="presetsList" class="presets-list"></div>
+            <div id="presetsEmpty" class="empty">暂无预设数据</div>
+          </div>
+
+          <!-- Tab: 文章草稿 -->
+          <div class="tab-content" id="draft-tab">
+            <div id="draftContent" class="draft-preview"></div>
+            <div id="draftEmpty" class="empty">草稿生成后在这里显示</div>
+          </div>
+
+          <!-- Tab: 运行日志 -->
+          <div class="tab-content" id="logs-tab">
+            <div id="log" class="log"></div>
+          </div>
+        </div>
+
+        <!-- 页面预览 -->
+        <div class="panel">
+          <h2>页面预览</h2>
+          <div id="previewHint" class="empty">生成完成后自动预览</div>
+          <iframe
+            id="previewFrame"
+            style="display:none;width:100%;min-height:600px;border:1px solid var(--line);border-radius:6px;background:#fff;"
+          ></iframe>
         </div>
       </div>
-      <p class="note">生成文章和图片通常需要几分钟，所以接口采用任务模式：先创建任务，再轮询任务状态，成功后读取结果。</p>
-    </section>
-
-    <section>
-      <h2>接口列表</h2>
-      <div class="card">
-        <h3><span class="method">GET</span>/api/presets</h3>
-        <p>获取可用创意预设列表。</p>
-        <pre>curl http://127.0.0.1:8765/api/presets</pre>
-        <p>请求参数：无。响应字段见下方 <code>Preset</code> 模型。</p>
-      </div>
-
-      <div class="card">
-        <h3><span class="method">GET</span>/api/presets/raw</h3>
-        <p>获取与 <code>grok_wechat_article_presets.json</code> 同结构的原始预设 JSON，适合外部系统直接同步配置。</p>
-        <pre>curl http://127.0.0.1:8765/api/presets/raw</pre>
-        <p>请求参数：无。成功返回 <code>{"presets": Preset[]}</code>，但不额外追加 <code>index</code> 字段。</p>
-      </div>
-
-      <div class="card">
-        <h3><span class="method">POST</span>/api/presets/generate</h3>
-        <p>根据一句需求动态生成多套创意预设，返回结构可直接作为预设 JSON 使用。</p>
-        <pre>curl -X POST http://127.0.0.1:8765/api/presets/generate \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "brief": "面向家长的 AI 教育公众号选题",
-    "count": 3,
-    "aspect_ratio": "4:3",
-    "resolution": "2k"
-  }'</pre>
-        <p>请求体字段见下方“生成预设请求体”。成功返回 <code>{"presets": Preset[]}</code>。</p>
-      </div>
-
-      <div class="card">
-        <h3><span class="method">POST</span>/api/presets/complete</h3>
-        <p>把用户给的创意、半成品 preset 或少数字段补全成标准 <code>Preset</code>。</p>
-        <pre>curl -X POST http://127.0.0.1:8765/api/presets/complete \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "idea": "未来生活方式想象",
-    "preset": {
-      "topic": "如果 AI 成为每个人的第二大脑，未来生活会发生哪些具体变化"
-    }
-  }'</pre>
-        <p>请求体字段见下方“补全预设请求体”。成功返回 <code>{"preset": Preset}</code>。</p>
-      </div>
-
-      <div class="card">
-        <h3><span class="method">POST</span>/api/articles</h3>
-        <p>创建一个文章生成任务。接口立即返回 <code>job_id</code>，实际生成在后台执行。</p>
-        <pre>curl -X POST http://127.0.0.1:8765/api/articles \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "preset_index": 5,
-    "topic": "AI 会怎样改变孩子未来十年的学习方式",
-    "sections": 4,
-    "aspect_ratio": "4:3"
-  }'</pre>
-        <p>请求体字段见下方“创建任务请求体”。成功返回 HTTP <code>202</code> 和 <code>Job</code> 对象。</p>
-      </div>
-
-      <div class="card">
-        <h3><span class="method">GET</span>/api/jobs</h3>
-        <p>获取历史任务列表，最新任务排在前面。</p>
-        <pre>curl http://127.0.0.1:8765/api/jobs</pre>
-        <p>请求参数：无。成功返回 <code>{"jobs": Job[]}</code>。</p>
-      </div>
-
-      <div class="card">
-        <h3><span class="method">GET</span>/api/jobs/{job_id}</h3>
-        <p>查询单个任务状态和运行日志。</p>
-        <pre>curl http://127.0.0.1:8765/api/jobs/article-20260426-230000-abcd1234</pre>
-        <p>路径参数：<code>job_id</code> 是创建任务时返回的任务 ID。成功返回 <code>Job</code> 对象。</p>
-      </div>
-
-      <div class="card">
-        <h3><span class="method">GET</span>/api/jobs/{job_id}/result</h3>
-        <p>任务成功后，获取完整结果 JSON。包含文章草稿、图片信息和可访问链接。</p>
-        <pre>curl http://127.0.0.1:8765/api/jobs/article-20260426-230000-abcd1234/result</pre>
-        <p>只有任务状态为 <code>succeeded</code> 时可读取。未完成时返回 HTTP <code>409</code>。</p>
-      </div>
-
-      <div class="card">
-        <h3><span class="method">GET</span>/api/schema</h3>
-        <p>获取机器可读的数据结构定义，重点包含 <code>/api/jobs/{job_id}/result</code> 的完整 JSON schema。</p>
-        <pre>curl http://127.0.0.1:8765/api/schema</pre>
-        <p>请求参数：无。成功返回 <code>{"schemas": {...}}</code>。</p>
-      </div>
-
-      <div class="card">
-        <h3><span class="method">GET</span>/outputs/{job_id}/article.html</h3>
-        <p>直接打开生成后的 HTML 页面。其他文件同理，例如 <code>article.md</code>、<code>article.json</code>、<code>images/cover.png</code>。</p>
-        <pre>open http://127.0.0.1:8765/outputs/article-20260426-230000-abcd1234/article.html</pre>
-        <p>返回静态文件内容。Markdown、JSON、HTML 均使用 UTF-8 响应头。</p>
-      </div>
-    </section>
-
-    <section>
-      <h2>创建任务请求体</h2>
-      <table>
-        <thead>
-          <tr><th>字段</th><th>类型</th><th>必填</th><th>默认值</th><th>约束</th><th>说明</th></tr>
-        </thead>
-        <tbody>
-          <tr><td><code>preset_index</code></td><td>number</td><td>否</td><td><code>5</code></td><td>1 到当前预设数量</td><td>选择使用哪一套创意预设。</td></tr>
-          <tr><td><code>topic</code></td><td>string</td><td>否</td><td>预设 topic</td><td>非空字符串</td><td>覆盖预设主题。</td></tr>
-          <tr><td><code>audience</code></td><td>string</td><td>否</td><td>预设 audience</td><td>字符串</td><td>目标读者描述。</td></tr>
-          <tr><td><code>tone</code></td><td>string</td><td>否</td><td>预设 tone</td><td>字符串</td><td>文章语气和编辑风格。</td></tr>
-          <tr><td><code>sections</code></td><td>number</td><td>否</td><td>预设 section_count</td><td>1 到 8</td><td>正文小节数量。会同时影响文章结构和配图数量。</td></tr>
-          <tr><td><code>use_web_search</code></td><td>boolean</td><td>否</td><td>预设 use_web_search</td><td><code>true</code> 或 <code>false</code></td><td>是否允许文本模型使用联网搜索。</td></tr>
-          <tr><td><code>image_style</code></td><td>string</td><td>否</td><td>预设 image_style</td><td>字符串</td><td>覆盖封面和正文配图的视觉风格，建议英文。</td></tr>
-          <tr><td><code>aspect_ratio</code></td><td>string</td><td>否</td><td>预设 aspect_ratio</td><td>例如 <code>16:9</code>、<code>4:3</code></td><td>图片比例。</td></tr>
-          <tr><td><code>resolution</code></td><td>string</td><td>否</td><td>预设 resolution</td><td>例如 <code>1k</code>、<code>2k</code></td><td>图片清晰度。</td></tr>
-          <tr><td><code>preset</code></td><td>object</td><td>否</td><td>-</td><td><code>Preset</code> 对象</td><td>可以直接传 <code>/api/presets/complete</code> 返回的 preset。服务会自动把 <code>section_count</code> 映射为 <code>sections</code>。</td></tr>
-        </tbody>
-      </table>
-      <div class="card">
-        <h3>用补全后的 preset 创建文章</h3>
-        <pre>curl -X POST http://127.0.0.1:8765/api/articles \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "preset": {
-      "name": "未来生活方式想象",
-      "topic": "如果 AI 成为每个人的第二大脑，未来生活会发生哪些具体变化",
-      "audience": "喜欢未来趋势、科技生活方式和想象力内容的读者",
-      "tone": "画面感强、可读性高、兼具启发与讨论感",
-      "section_count": 4,
-      "use_web_search": false,
-      "image_style": "speculative future lifestyle illustration, cinematic interiors, human-centered technology, no text overlay",
-      "aspect_ratio": "16:9",
-      "resolution": "2k"
-    }
-  }'</pre>
-      </div>
-    </section>
-
-    <section>
-      <h2>生成预设请求体</h2>
-      <table>
-        <thead>
-          <tr><th>字段</th><th>类型</th><th>必填</th><th>默认值</th><th>约束</th><th>说明</th></tr>
-        </thead>
-        <tbody>
-          <tr><td><code>brief</code></td><td>string</td><td>是</td><td>-</td><td>非空字符串</td><td>创意生成需求，例如“面向家长的 AI 教育公众号选题”。也可用 <code>topic</code> 或 <code>idea</code> 作为别名。</td></tr>
-          <tr><td><code>count</code></td><td>number</td><td>否</td><td><code>5</code></td><td>1 到 10</td><td>生成几套预设。</td></tr>
-          <tr><td><code>audience</code></td><td>string</td><td>否</td><td>模型自动判断</td><td>字符串</td><td>给模型的目标读者约束。</td></tr>
-          <tr><td><code>tone</code></td><td>string</td><td>否</td><td>模型自动判断</td><td>字符串</td><td>给模型的语气约束。</td></tr>
-          <tr><td><code>use_web_search</code></td><td>boolean</td><td>否</td><td>模型自动判断</td><td><code>true</code> 或 <code>false</code></td><td>给生成预设时的联网搜索倾向。</td></tr>
-          <tr><td><code>image_style</code></td><td>string</td><td>否</td><td>模型自动判断</td><td>字符串</td><td>给模型的图片风格约束。</td></tr>
-          <tr><td><code>aspect_ratio</code></td><td>string</td><td>否</td><td>模型自动判断</td><td>例如 <code>16:9</code></td><td>希望生成预设采用的图片比例。</td></tr>
-          <tr><td><code>resolution</code></td><td>string</td><td>否</td><td>模型自动判断</td><td>例如 <code>2k</code></td><td>希望生成预设采用的图片清晰度。</td></tr>
-        </tbody>
-      </table>
-    </section>
-
-    <section>
-      <h2>补全预设请求体</h2>
-      <table>
-        <thead>
-          <tr><th>字段</th><th>类型</th><th>必填</th><th>说明</th></tr>
-        </thead>
-        <tbody>
-          <tr><td><code>idea</code></td><td>string</td><td>否</td><td>用户一句话创意，例如“未来生活方式想象”。当 <code>preset</code> 很少时建议提供。</td></tr>
-          <tr><td><code>preset</code></td><td>object</td><td>否</td><td>半成品预设。可以只传 <code>name</code>、<code>topic</code> 等部分字段。</td></tr>
-          <tr><td><code>partial</code></td><td>object</td><td>否</td><td><code>preset</code> 的别名。</td></tr>
-          <tr><td><code>name</code> 等顶层字段</td><td>mixed</td><td>否</td><td>也可以不包 <code>preset</code>，直接把 preset 字段放在请求体顶层。</td></tr>
-        </tbody>
-      </table>
-      <div class="card">
-        <h3>补全请求示例</h3>
-        <pre>{
-  "idea": "未来生活方式想象",
-  "preset": {
-    "name": "未来生活方式想象",
-    "topic": "如果 AI 成为每个人的第二大脑，未来生活会发生哪些具体变化"
-  }
-}</pre>
-      </div>
-      <div class="card">
-        <h3>补全响应示例</h3>
-        <pre>{
-  "preset": {
-    "name": "未来生活方式想象",
-    "topic": "如果 AI 成为每个人的第二大脑，未来生活会发生哪些具体变化",
-    "audience": "喜欢未来趋势、科技生活方式和想象力内容的读者",
-    "tone": "画面感强、可读性高、兼具启发与讨论感",
-    "section_count": 4,
-    "use_web_search": false,
-    "image_style": "speculative future lifestyle illustration, cinematic interiors, human-centered technology, no text overlay",
-    "aspect_ratio": "16:9",
-    "resolution": "2k"
-  }
-}</pre>
-      </div>
-    </section>
-
-    <section>
-      <h2>响应模型</h2>
-      <div class="card">
-        <h3>Preset</h3>
-        <table>
-          <thead><tr><th>字段</th><th>类型</th><th>说明</th></tr></thead>
-          <tbody>
-            <tr><td><code>index</code></td><td>number</td><td>1-based 预设序号，创建任务时传入 <code>preset_index</code>。</td></tr>
-            <tr><td><code>name</code></td><td>string</td><td>预设名称。</td></tr>
-            <tr><td><code>topic</code></td><td>string</td><td>文章主题。</td></tr>
-            <tr><td><code>audience</code></td><td>string</td><td>目标读者。</td></tr>
-            <tr><td><code>tone</code></td><td>string</td><td>文章语气。</td></tr>
-            <tr><td><code>section_count</code></td><td>number</td><td>默认小节数。</td></tr>
-            <tr><td><code>use_web_search</code></td><td>boolean</td><td>是否默认启用联网搜索。</td></tr>
-            <tr><td><code>image_style</code></td><td>string</td><td>默认图片风格。</td></tr>
-            <tr><td><code>aspect_ratio</code></td><td>string</td><td>默认图片比例。</td></tr>
-            <tr><td><code>resolution</code></td><td>string</td><td>默认图片清晰度。</td></tr>
-          </tbody>
-        </table>
-      </div>
-      <div class="card">
-        <h3>Job</h3>
-        <table>
-          <thead><tr><th>字段</th><th>类型</th><th>说明</th></tr></thead>
-          <tbody>
-            <tr><td><code>job_id</code></td><td>string</td><td>任务 ID，也是输出目录名。</td></tr>
-            <tr><td><code>status</code></td><td>string</td><td><code>queued</code>、<code>running</code>、<code>succeeded</code>、<code>failed</code>。</td></tr>
-            <tr><td><code>created_at</code></td><td>string</td><td>UTC ISO 时间。</td></tr>
-            <tr><td><code>started_at</code></td><td>string | null</td><td>任务开始时间。排队中可能不存在。</td></tr>
-            <tr><td><code>finished_at</code></td><td>string | null</td><td>任务结束时间。未结束时可能不存在。</td></tr>
-            <tr><td><code>updated_at</code></td><td>string</td><td>任务状态最近更新时间。</td></tr>
-            <tr><td><code>request</code></td><td>object</td><td>创建任务时最终采用的请求参数。</td></tr>
-            <tr><td><code>result</code></td><td>object | null</td><td>任务成功后出现，字段见 <code>JobResult</code>。</td></tr>
-            <tr><td><code>error</code></td><td>string | null</td><td>失败原因。仅失败时有值。</td></tr>
-            <tr><td><code>logs</code></td><td>array</td><td>运行日志数组，每项包含 <code>at</code> 和 <code>message</code>。</td></tr>
-          </tbody>
-        </table>
-      </div>
-      <div class="card">
-        <h3>JobResult</h3>
-        <table>
-          <thead><tr><th>字段</th><th>类型</th><th>说明</th></tr></thead>
-          <tbody>
-            <tr><td><code>article_html</code></td><td>string</td><td>生成 HTML 的访问路径。</td></tr>
-            <tr><td><code>article_markdown</code></td><td>string</td><td>生成 Markdown 的访问路径。</td></tr>
-            <tr><td><code>article_json</code></td><td>string</td><td>生成结果 manifest 的访问路径。</td></tr>
-            <tr><td><code>draft_markdown</code></td><td>string</td><td>未生图前的文章草稿 Markdown。</td></tr>
-            <tr><td><code>draft_json</code></td><td>string</td><td>未生图前的文章草稿 JSON。</td></tr>
-            <tr><td><code>output_dir</code></td><td>string</td><td>服务端本地输出目录。</td></tr>
-            <tr><td><code>title</code></td><td>string</td><td>生成文章标题。</td></tr>
-            <tr><td><code>summary</code></td><td>string</td><td>文章摘要。</td></tr>
-            <tr><td><code>tags</code></td><td>string[]</td><td>文章标签。</td></tr>
-            <tr><td><code>image_count</code></td><td>number</td><td>图片数量，通常是封面 1 张加正文每节 1 张。</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
-
-    <section>
-      <h2>完整结果 JSON 结构</h2>
-      <p><code>GET /api/jobs/{job_id}/result</code> 直接读取生成的 <code>article.json</code>，并额外追加 <code>links</code> 字段。</p>
-      <table>
-        <thead><tr><th>字段</th><th>类型</th><th>说明</th></tr></thead>
-        <tbody>
-          <tr><td><code>request</code></td><td>object</td><td>本次生成使用的文章请求参数。</td></tr>
-          <tr><td><code>draft</code></td><td>object</td><td>文章草稿，包含 <code>title</code>、<code>subtitle</code>、<code>summary</code>、<code>intro_paragraphs</code>、<code>sections</code>、<code>tags</code> 等。</td></tr>
-          <tr><td><code>draft.sections[]</code></td><td>array</td><td>每个小节包含 <code>heading</code>、<code>hook</code>、<code>paragraphs</code>、<code>bullets</code>、<code>takeaway</code>、<code>image_prompt</code>、<code>image_alt</code>、<code>image_caption</code>。</td></tr>
-          <tr><td><code>cover_image</code></td><td>object</td><td>封面图信息，包含 <code>prompt</code>、<code>source_url</code>、<code>alt_text</code>、<code>caption</code>、<code>local_path</code>。</td></tr>
-          <tr><td><code>section_images[]</code></td><td>array</td><td>正文配图信息，字段同 <code>cover_image</code>。</td></tr>
-          <tr><td><code>generated_at</code></td><td>string</td><td>生成完成时间，UTC ISO 格式。</td></tr>
-          <tr><td><code>links</code></td><td>object</td><td>HTTP 可访问链接，包含 HTML、Markdown、JSON、草稿和输出目录路径。</td></tr>
-        </tbody>
-      </table>
-      <div class="card">
-        <h3>ArticleResult 完整 JSON 示例</h3>
-        <pre>{
-  "request": {
-    "topic": "如果 AI 成为每个人的第二大脑，未来生活会发生哪些具体变化",
-    "audience": "喜欢未来趋势、科技生活方式和想象力内容的读者",
-    "tone": "画面感强、可读性高、兼具启发与讨论感",
-    "sections": 4,
-    "use_web_search": false,
-    "image_style": "speculative future lifestyle illustration, cinematic interiors, human-centered technology, no text overlay",
-    "aspect_ratio": "16:9",
-    "resolution": "2k"
-  },
-  "draft": {
-    "title": "当 AI 成为第二大脑，生活会怎样被重写",
-    "subtitle": "从记忆、决策到陪伴，理解未来生活方式的真实变化",
-    "summary": "一段适合公众号摘要区的文章摘要。",
-    "cover_image_prompt": "English cover image prompt, no text overlay",
-    "cover_image_alt": "封面图中文替代文本",
-    "intro_paragraphs": [
-      "导语第一段。",
-      "导语第二段。"
-    ],
-    "sections": [
-      {
-        "heading": "记忆不再只是存在脑海里",
-        "hook": "AI 会先改变我们保存和调用信息的方式。",
-        "paragraphs": [
-          "小节正文第一段。",
-          "小节正文第二段。"
-        ],
-        "bullets": [
-          "要点一",
-          "要点二",
-          "要点三"
-        ],
-        "takeaway": "本节总结句。",
-        "image_prompt": "English section image prompt, no text overlay",
-        "image_alt": "正文配图中文替代文本",
-        "image_caption": "正文配图说明"
-      }
-    ],
-    "conclusion_title": "真正重要的是重新定义自己",
-    "conclusion_paragraphs": [
-      "结尾第一段。",
-      "结尾第二段。"
-    ],
-    "call_to_action": "引导读者评论、收藏或转发的话术。",
-    "tags": [
-      "AI生活方式",
-      "未来趋势",
-      "第二大脑"
-    ]
-  },
-  "cover_image": {
-    "prompt": "English cover image prompt, no text overlay",
-    "source_url": "https://...",
-    "alt_text": "封面图中文替代文本",
-    "caption": "封面图说明",
-    "revised_prompt": null,
-    "local_path": "cover.png"
-  },
-  "section_images": [
-    {
-      "prompt": "English section image prompt, no text overlay",
-      "source_url": "https://...",
-      "alt_text": "正文配图中文替代文本",
-      "caption": "正文配图说明",
-      "revised_prompt": null,
-      "local_path": "section-01.png"
-    }
-  ],
-  "generated_at": "2026-04-27T00:00:00Z",
-  "links": {
-    "article_html": "/outputs/article-20260426-230000-abcd1234/article.html",
-    "article_markdown": "/outputs/article-20260426-230000-abcd1234/article.md",
-    "article_json": "/outputs/article-20260426-230000-abcd1234/article.json",
-    "draft_markdown": "/outputs/article-20260426-230000-abcd1234/draft.md",
-    "draft_json": "/outputs/article-20260426-230000-abcd1234/draft.json",
-    "output_dir": "/Users/huchangfeng/smolagents-study/examples/generated_articles/article-20260426-230000-abcd1234"
-  }
-}</pre>
-      </div>
-      <div class="card">
-        <h3>ArticleResult 字段说明</h3>
-        <table>
-          <thead><tr><th>路径</th><th>类型</th><th>是否必有</th><th>说明</th></tr></thead>
-          <tbody>
-            <tr><td><code>request.topic</code></td><td>string</td><td>是</td><td>生成文章时最终使用的主题。</td></tr>
-            <tr><td><code>request.audience</code></td><td>string</td><td>是</td><td>目标读者。</td></tr>
-            <tr><td><code>request.tone</code></td><td>string</td><td>是</td><td>文章语气。</td></tr>
-            <tr><td><code>request.sections</code></td><td>number</td><td>是</td><td>正文小节数。</td></tr>
-            <tr><td><code>request.use_web_search</code></td><td>boolean</td><td>是</td><td>文本生成是否允许联网搜索。</td></tr>
-            <tr><td><code>request.image_style</code></td><td>string</td><td>是</td><td>图片生成风格。</td></tr>
-            <tr><td><code>request.aspect_ratio</code></td><td>string</td><td>是</td><td>图片比例。</td></tr>
-            <tr><td><code>request.resolution</code></td><td>string</td><td>是</td><td>图片清晰度。</td></tr>
-            <tr><td><code>draft.title</code></td><td>string</td><td>是</td><td>文章标题。</td></tr>
-            <tr><td><code>draft.subtitle</code></td><td>string</td><td>是</td><td>文章副标题。</td></tr>
-            <tr><td><code>draft.summary</code></td><td>string</td><td>是</td><td>文章摘要。</td></tr>
-            <tr><td><code>draft.cover_image_prompt</code></td><td>string</td><td>是</td><td>封面图英文提示词。</td></tr>
-            <tr><td><code>draft.cover_image_alt</code></td><td>string</td><td>是</td><td>封面图 alt 文案。</td></tr>
-            <tr><td><code>draft.intro_paragraphs[]</code></td><td>string[]</td><td>是</td><td>导语段落。</td></tr>
-            <tr><td><code>draft.sections[]</code></td><td>object[]</td><td>是</td><td>正文小节数组。</td></tr>
-            <tr><td><code>draft.sections[].heading</code></td><td>string</td><td>是</td><td>小节标题。</td></tr>
-            <tr><td><code>draft.sections[].hook</code></td><td>string</td><td>是</td><td>小节开场钩子。</td></tr>
-            <tr><td><code>draft.sections[].paragraphs[]</code></td><td>string[]</td><td>是</td><td>小节正文段落。</td></tr>
-            <tr><td><code>draft.sections[].bullets[]</code></td><td>string[]</td><td>是</td><td>小节要点列表。</td></tr>
-            <tr><td><code>draft.sections[].takeaway</code></td><td>string</td><td>是</td><td>小节总结句。</td></tr>
-            <tr><td><code>draft.sections[].image_prompt</code></td><td>string</td><td>是</td><td>小节配图英文提示词。</td></tr>
-            <tr><td><code>draft.sections[].image_alt</code></td><td>string</td><td>是</td><td>小节配图 alt 文案。</td></tr>
-            <tr><td><code>draft.sections[].image_caption</code></td><td>string</td><td>是</td><td>小节配图说明。</td></tr>
-            <tr><td><code>draft.conclusion_title</code></td><td>string</td><td>是</td><td>结尾标题。</td></tr>
-            <tr><td><code>draft.conclusion_paragraphs[]</code></td><td>string[]</td><td>是</td><td>结尾段落。</td></tr>
-            <tr><td><code>draft.call_to_action</code></td><td>string</td><td>是</td><td>公众号互动引导。</td></tr>
-            <tr><td><code>draft.tags[]</code></td><td>string[]</td><td>是</td><td>文章标签。</td></tr>
-            <tr><td><code>cover_image</code></td><td>object</td><td>是</td><td>封面图对象，字段同 <code>GeneratedImage</code>。</td></tr>
-            <tr><td><code>section_images[]</code></td><td>object[]</td><td>是</td><td>正文配图数组，顺序对应 <code>draft.sections[]</code>。</td></tr>
-            <tr><td><code>*.prompt</code></td><td>string</td><td>是</td><td>图片原始提示词。</td></tr>
-            <tr><td><code>*.source_url</code></td><td>string</td><td>是</td><td>xAI 返回的图片远程 URL。</td></tr>
-            <tr><td><code>*.alt_text</code></td><td>string</td><td>是</td><td>图片替代文本。</td></tr>
-            <tr><td><code>*.caption</code></td><td>string</td><td>是</td><td>图片说明。</td></tr>
-            <tr><td><code>*.revised_prompt</code></td><td>string | null</td><td>否</td><td>模型修订后的提示词，接口未返回时为 <code>null</code> 或不存在。</td></tr>
-            <tr><td><code>*.local_path</code></td><td>string | null</td><td>否</td><td>本地图片文件名，例如 <code>cover.png</code>。</td></tr>
-            <tr><td><code>generated_at</code></td><td>string</td><td>是</td><td>生成完成时间，UTC ISO 格式。</td></tr>
-            <tr><td><code>links.article_html</code></td><td>string</td><td>是</td><td>HTML 访问路径。</td></tr>
-            <tr><td><code>links.article_markdown</code></td><td>string</td><td>是</td><td>Markdown 访问路径。</td></tr>
-            <tr><td><code>links.article_json</code></td><td>string</td><td>是</td><td>原始 manifest JSON 访问路径。</td></tr>
-            <tr><td><code>links.draft_markdown</code></td><td>string</td><td>是</td><td>草稿 Markdown 访问路径。</td></tr>
-            <tr><td><code>links.draft_json</code></td><td>string</td><td>是</td><td>草稿 JSON 访问路径。</td></tr>
-            <tr><td><code>links.output_dir</code></td><td>string</td><td>是</td><td>服务端本地输出目录。</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
-
-    <section>
-      <h2>错误返回</h2>
-      <table>
-        <thead><tr><th>HTTP 状态</th><th>场景</th><th>返回示例</th></tr></thead>
-        <tbody>
-          <tr><td><code>400</code></td><td>JSON 无效、参数类型不对、<code>preset_index</code> 越界。</td><td><code>{"error":"preset_index must be between 1 and 10."}</code></td></tr>
-          <tr><td><code>401</code></td><td>启用 <code>GROK_WECHAT_API_KEY</code> 后，缺少或传错 <code>X-API-Key</code>。</td><td><code>{"error":"Missing or invalid X-API-Key header."}</code></td></tr>
-          <tr><td><code>404</code></td><td>任务或输出文件不存在。</td><td><code>{"error":"Unknown job: ..."}</code></td></tr>
-          <tr><td><code>409</code></td><td>任务还没成功就读取 <code>/result</code>。</td><td><code>{"error":"Job has not succeeded yet.","job":{...}}</code></td></tr>
-        </tbody>
-      </table>
-    </section>
-
-    <section>
-      <h2>返回示例</h2>
-      <div class="card">
-        <h3>创建任务响应</h3>
-        <pre>{
-  "job_id": "article-20260426-230000-abcd1234",
-  "status": "queued",
-  "created_at": "2026-04-26T15:00:00Z",
-  "request": {
-    "preset_index": 5,
-    "sections": 4
-  },
-  "result": null,
-  "error": null,
-  "logs": []
-}</pre>
-      </div>
-      <div class="card">
-        <h3>成功任务响应</h3>
-        <pre>{
-  "job_id": "article-20260426-230000-abcd1234",
-  "status": "succeeded",
-  "result": {
-    "article_html": "/outputs/article-20260426-230000-abcd1234/article.html",
-    "article_markdown": "/outputs/article-20260426-230000-abcd1234/article.md",
-    "article_json": "/outputs/article-20260426-230000-abcd1234/article.json",
-    "title": "AI如何重塑孩子未来十年的学习路径",
-    "image_count": 5
-  }
-}</pre>
-      </div>
-    </section>
-
-    <section>
-      <h2>状态说明</h2>
-      <table>
-        <thead>
-          <tr><th>状态</th><th>含义</th></tr>
-        </thead>
-        <tbody>
-          <tr><td><code>queued</code></td><td>任务已创建，等待后台线程启动。</td></tr>
-          <tr><td><code>running</code></td><td>正在生成文章草稿、图片或输出文件。</td></tr>
-          <tr><td><code>succeeded</code></td><td>已生成完整结果，可以读取 <code>/result</code> 或打开 HTML。</td></tr>
-          <tr><td><code>failed</code></td><td>任务失败，查看 <code>error</code> 和 <code>logs</code> 字段定位原因。</td></tr>
-        </tbody>
-      </table>
-    </section>
+    </main>
   </div>
+
+  <script>
+    // ===== 状态管理 =====
+    const state = {
+      presets: [],
+      draft: null,
+      currentPresetIndex: null,
+      jobId: null,
+      pollTimer: null,
+      stepTimings: { 1: null, 2: null, 3: null, 4: null },
+      startTime: null
+    };
+
+    // ===== 元素引用 =====
+    const els = {
+      preset: document.getElementById("preset"),
+      topic: document.getElementById("topic"),
+      audience: document.getElementById("audience"),
+      tone: document.getElementById("tone"),
+      sections: document.getElementById("sections"),
+      aspect: document.getElementById("aspect"),
+      resolution: document.getElementById("resolution"),
+      storageMode: document.getElementById("storageMode"),
+      generationProfile: document.getElementById("generationProfile"),
+      useWebSearch: document.getElementById("useWebSearch"),
+      style: document.getElementById("style"),
+      presetBrief: document.getElementById("presetBrief"),
+      presetCount: document.getElementById("presetCount"),
+      completeIdea: document.getElementById("completeIdea"),
+      generatePresets: document.getElementById("generatePresets"),
+      completePreset: document.getElementById("completePreset"),
+      generate: document.getElementById("generate"),
+      statusBadge: document.getElementById("statusBadge"),
+      processBar: document.getElementById("processBar"),
+      jobId: document.getElementById("jobId"),
+      jobStatus: document.getElementById("jobStatus"),
+      title: document.getElementById("title"),
+      imageCount: document.getElementById("imageCount"),
+      links: document.getElementById("links"),
+      message: document.getElementById("message"),
+      log: document.getElementById("log"),
+      previewHint: document.getElementById("previewHint"),
+      previewFrame: document.getElementById("previewFrame"),
+      presetsList: document.getElementById("presetsList"),
+      draftContent: document.getElementById("draftContent"),
+      tabButtons: document.querySelectorAll(".tab-button"),
+      tabContents: document.querySelectorAll(".tab-content")
+    };
+
+    // ===== 事件绑定 =====
+    els.generatePresets.addEventListener("click", handleGeneratePresets);
+    els.completePreset.addEventListener("click", handleCompletePreset);
+    els.generate.addEventListener("click", handleGenerate);
+    els.preset.addEventListener("change", handlePresetChange);
+    els.tabButtons.forEach(btn => {
+      btn.addEventListener("click", () => switchTab(btn.dataset.tab));
+    });
+
+    // ===== Tab 切换 =====
+    function switchTab(tabName) {
+      els.tabButtons.forEach(btn => btn.classList.toggle("active", btn.dataset.tab === tabName));
+      els.tabContents.forEach(content => content.classList.toggle("active", content.id === tabName + "-tab"));
+    }
+
+    // ===== 状态更新 =====
+    function updateStatus(text) {
+      els.statusBadge.textContent = text;
+    }
+
+    function updateProcessStep(step) {
+      if (step >= 1 && step <= 4) {
+        for (let i = 1; i <= 4; i++) {
+          const stepEl = document.getElementById(`step${i}`);
+          stepEl.classList.toggle("active", i === step);
+          stepEl.classList.toggle("done", i < step);
+        }
+      }
+    }
+
+    // ===== 预设处理 =====
+    async function handleGeneratePresets() {
+      const brief = els.presetBrief.value.trim();
+      if (!brief) {
+        alert("请输入创意简报");
+        return;
+      }
+      els.generatePresets.disabled = true;
+      updateStatus("生成预设中...");
+      try {
+        const res = await fetch("/api/presets/generate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ brief, count: parseInt(els.presetCount.value) || 5 })
+        });
+        const data = await res.json();
+        if (data.presets) {
+          displayPresets(data.presets);
+          switchTab("presets");
+        }
+      } catch (err) {
+        alert("生成预设失败: " + err.message);
+      } finally {
+        els.generatePresets.disabled = false;
+        updateStatus("准备就绪");
+      }
+    }
+
+    function displayPresets(presets) {
+      state.presets = presets;
+      els.presetsList.innerHTML = presets.map((p, i) => `
+        <div class="preset-card" data-index="${i}">
+          <div class="preset-card-name">${p.name}</div>
+          <div class="preset-card-info">
+            <div><b>主题：</b>${p.topic}</div>
+            <div style="margin-top: 4px;"><b>读者：</b>${p.audience}</div>
+            <div style="margin-top: 4px;"><b>语气：</b>${p.tone}</div>
+          </div>
+        </div>
+      `).join("");
+
+      els.presetsList.querySelectorAll(".preset-card").forEach((card, i) => {
+        card.addEventListener("click", () => selectPreset(i));
+      });
+    }
+
+    function selectPreset(index) {
+      const preset = state.presets[index];
+      if (!preset) return;
+      els.presetsList.querySelectorAll(".preset-card").forEach((card, i) => {
+        card.classList.toggle("selected", i === index);
+      });
+      applyPreset(preset);
+    }
+
+    function applyPreset(preset) {
+      els.topic.value = preset.topic || "";
+      els.audience.value = preset.audience || "";
+      els.tone.value = preset.tone || "";
+      els.sections.value = preset.section_count || "";
+      els.aspect.value = preset.aspect_ratio || "";
+      els.resolution.value = preset.resolution || "";
+      els.useWebSearch.checked = !!preset.use_web_search;
+      els.style.value = preset.image_style || "";
+    }
+
+    async function handleCompletePreset() {
+      const idea = els.completeIdea.value.trim();
+      if (!idea) {
+        alert("请输入创意描述");
+        return;
+      }
+      els.completePreset.disabled = true;
+      updateStatus("完成创意中...");
+      try {
+        const res = await fetch("/api/presets/complete", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ idea })
+        });
+        const data = await res.json();
+        if (data.preset) {
+          applyPreset(data.preset);
+          alert("创意已自动补全");
+        }
+      } catch (err) {
+        alert("完成创意失败: " + err.message);
+      } finally {
+        els.completePreset.disabled = false;
+        updateStatus("准备就绪");
+      }
+    }
+
+    // ===== 文章生成 =====
+    async function handleGenerate() {
+      if (!els.topic.value.trim()) {
+        alert("请先填入主题");
+        return;
+      }
+
+      els.generate.disabled = true;
+      state.jobId = null;
+      state.stepTimings = { 1: null, 2: null, 3: null, 4: null };
+      state.startTime = Date.now();
+      els.processBar.style.display = "grid";
+      updateStatus("生成中...");
+      updateProcessStep(1);
+
+      try {
+        const payload = {
+          topic: els.topic.value,
+          audience: els.audience.value,
+          tone: els.tone.value,
+          sections: parseInt(els.sections.value) || undefined,
+          aspect_ratio: els.aspect.value || undefined,
+          resolution: els.resolution.value || undefined,
+          storage_mode: els.storageMode.value,
+          generation_profile: els.generationProfile.value,
+          use_web_search: els.useWebSearch.checked,
+          image_style: els.style.value
+        };
+
+        const res = await fetch("/api/articles", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+
+        const job = await res.json();
+        if (job.job_id) {
+          state.jobId = job.job_id;
+          els.jobId.textContent = job.job_id;
+          els.log.textContent = "";
+          els.message.style.display = "none";
+          els.links.style.display = "none";
+          switchTab("logs");
+          pollStatus();
+        } else {
+          alert("创建任务失败");
+        }
+      } catch (err) {
+        alert("生成失败: " + err.message);
+      } finally {
+        els.generate.disabled = false;
+      }
+    }
+
+    // ===== 轮询状态 =====
+    function pollStatus() {
+      if (!state.jobId) return;
+
+      fetch(`/api/jobs/${state.jobId}`)
+        .then(r => r.json())
+        .then(job => {
+          updateJobUI(job);
+
+          if (job.status === "succeeded" || job.status === "failed") {
+            clearTimeout(state.pollTimer);
+            els.generate.disabled = false;
+            updateStatus("完成");
+          } else {
+            state.pollTimer = setTimeout(pollStatus, 1000);
+          }
+        });
+    }
+
+    function updateJobUI(job) {
+      els.jobStatus.textContent = job.status;
+      els.jobStatus.style.color = job.status === "succeeded" ? "var(--good)" : job.status === "failed" ? "var(--bad)" : "var(--warn)";
+
+      if (job.result) {
+        els.title.textContent = job.result.title || "-";
+        els.imageCount.textContent = job.result.image_count || "-";
+
+        const links = [];
+        if (job.result.article_html) links.push(["📄 打开HTML", job.result.article_html, "open"]);
+        if (job.result.article_markdown) links.push(["📝 查看Markdown", job.result.article_markdown, "open"]);
+        if (job.result.article_json) links.push(["📦 下载JSON", job.result.article_json, "download"]);
+
+        els.links.innerHTML = links.map(([label, url, action]) => `
+          <button class="secondary" onclick="window.open('${url}', '_blank')">
+            ${label}
+          </button>
+        `).join("");
+        els.links.style.display = "flex";
+
+        if (job.result.article_html) {
+          els.previewFrame.src = job.result.article_html;
+          els.previewFrame.style.display = "block";
+          els.previewHint.style.display = "none";
+        }
+      }
+
+      if (job.draft) {
+        displayDraft(job.draft);
+        updateProcessStep(2);
+      }
+
+      if (job.logs) {
+        els.log.textContent = job.logs.map((log, i) => {
+          const timestamp = new Date().toLocaleTimeString();
+          return `[${timestamp}] ${log}`;
+        }).join("\n");
+        els.log.scrollTop = els.log.scrollHeight;
+      }
+    }
+
+    function displayDraft(draft) {
+      if (!draft) return;
+      const html = `
+        <div class="draft-title">${draft.title || ""}</div>
+        <div class="draft-subtitle">${draft.subtitle || ""}</div>
+        <div class="draft-summary">${draft.summary || ""}</div>
+        ${(draft.sections || []).map(section => `
+          <div class="draft-section">
+            <h4>${section.heading}</h4>
+            <p><strong>${section.hook}</strong></p>
+            ${(section.paragraphs || []).map(p => `<p>${p}</p>`).join("")}
+            <ul>${(section.bullets || []).map(b => `<li>${b}</li>`).join("")}</ul>
+          </div>
+        `).join("")}
+      `;
+      els.draftContent.innerHTML = html;
+    }
+
+    // ===== 初始化 =====
+    async function loadPresets() {
+      try {
+        const res = await fetch("/api/presets");
+        const data = await res.json();
+        els.preset.innerHTML = (data.presets || []).map((p, i) => `
+          <option value="${i}">${p.index}. ${p.name}</option>
+        `).join("");
+        if (data.presets.length > 0) {
+          handlePresetChange();
+        }
+      } catch (err) {
+        console.error("Failed to load presets:", err);
+      }
+    }
+
+    function handlePresetChange() {
+      const index = parseInt(els.preset.value);
+      if (index >= 0) {
+        // 根据需要应用preset
+      }
+    }
+
+    loadPresets();
+  </script>
+</body>
+</html>
+"""
+
+
+# ===== 新 UI（深色模态风格）=====
+NEW_UI_HTML = r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>✨ AI 文章创意工作室</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      background: linear-gradient(135deg, #0f172e 0%, #1a1f35 100%);
+      color: #e0e6ed;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", sans-serif;
+      min-height: 100vh;
+      overflow-x: hidden;
+    }
+
+    .container {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+
+    header {
+      background: rgba(20, 28, 50, 0.8);
+      backdrop-filter: blur(10px);
+      padding: 20px 0;
+      margin-bottom: 40px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+
+    header .inner {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 0 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    h1 {
+      font-size: 24px;
+      font-weight: 700;
+      background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .status-badge {
+      padding: 8px 16px;
+      background: rgba(99, 102, 241, 0.2);
+      border: 1px solid rgba(99, 102, 241, 0.5);
+      border-radius: 20px;
+      font-size: 12px;
+      font-weight: 600;
+      color: #a5b4fc;
+    }
+
+    main {
+      display: grid;
+      grid-template-columns: 400px 1fr;
+      gap: 30px;
+    }
+
+    .config-panel {
+      background: rgba(20, 28, 50, 0.5);
+      backdrop-filter: blur(10px);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 12px;
+      padding: 30px;
+      height: fit-content;
+      position: sticky;
+      top: 100px;
+    }
+
+    .config-panel h2 {
+      font-size: 18px;
+      margin-bottom: 20px;
+      color: #fff;
+    }
+
+    .form-group {
+      margin-bottom: 20px;
+    }
+
+    .form-group label {
+      display: block;
+      margin-bottom: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      color: #a0aec0;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .form-group input,
+    .form-group textarea,
+    .form-group select {
+      width: 100%;
+      padding: 12px;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 8px;
+      color: #e0e6ed;
+      font-family: inherit;
+      font-size: 13px;
+      transition: all 0.2s;
+    }
+
+    .form-group input:focus,
+    .form-group textarea:focus,
+    .form-group select:focus {
+      outline: none;
+      background: rgba(255, 255, 255, 0.1);
+      border-color: #6366f1;
+      box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.1);
+    }
+
+    .form-group textarea {
+      resize: vertical;
+      min-height: 80px;
+    }
+
+    button {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      width: 100%;
+      padding: 12px 16px;
+      background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+      color: white;
+      border: none;
+      border-radius: 8px;
+      font-weight: 600;
+      font-size: 13px;
+      cursor: pointer;
+      transition: all 0.2s;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    button:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 8px 20px rgba(99, 102, 241, 0.3);
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .btn-secondary {
+      background: rgba(255, 255, 255, 0.1);
+      color: #a5b4fc;
+    }
+
+    .btn-secondary:hover {
+      background: rgba(255, 255, 255, 0.15);
+    }
+
+    .content-area {
+      display: flex;
+      flex-direction: column;
+      gap: 30px;
+    }
+
+    .card {
+      background: rgba(20, 28, 50, 0.5);
+      backdrop-filter: blur(10px);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 12px;
+      padding: 30px;
+    }
+
+    .card h2 {
+      font-size: 18px;
+      margin-bottom: 20px;
+      color: #fff;
+    }
+
+    .modal {
+      display: none !important;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; }
+      to { opacity: 1; }
+    }
+
+    .modal-content {
+      background: rgba(20, 28, 50, 0.95);
+      backdrop-filter: blur(10px);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 16px;
+      padding: 40px;
+      max-width: 90%;
+      width: 1000px;
+      max-height: 90vh;
+      overflow-y: auto;
+      animation: slideUp 0.3s;
+    }
+
+    @keyframes slideUp {
+      from {
+        opacity: 0;
+        transform: translateY(20px);
+      }
+      to {
+        opacity: 0;
+        transform: translateY(0);
+      }
+    }
+
+    .modal-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 30px;
+      padding-bottom: 20px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+    }
+
+    .modal-header h2 {
+      margin: 0;
+      font-size: 24px;
+    }
+
+    .modal-close {
+      background: none;
+      border: none;
+      color: #a0aec0;
+      font-size: 28px;
+      cursor: pointer;
+      padding: 0;
+      width: auto;
+      transition: color 0.2s;
+    }
+
+    .modal-close:hover {
+      color: #e0e6ed;
+    }
+
+    .presets-list {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .preset-card {
+      background: rgba(255, 255, 255, 0.05);
+      border: 2px solid rgba(255, 255, 255, 0.1);
+      border-radius: 12px;
+      padding: 16px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .preset-card:hover {
+      border-color: #6366f1;
+      background: rgba(99, 102, 241, 0.1);
+    }
+
+    .preset-card.selected {
+      border-color: #6366f1;
+      background: rgba(99, 102, 241, 0.2);
+      box-shadow: 0 0 20px rgba(99, 102, 241, 0.2);
+    }
+
+    .preset-card-name {
+      font-size: 15px;
+      font-weight: 700;
+      margin-bottom: 12px;
+      color: #fff;
+      min-height: 20px;
+    }
+
+    .preset-card-info {
+      font-size: 12px;
+      color: #a0aec0;
+      line-height: 1.8;
+    }
+
+    .preset-card-info div {
+      margin-bottom: 8px;
+      word-break: break-word;
+      display: block;
+    }
+
+    .preset-card-info strong {
+      color: #cbd5e1;
+      display: inline;
+      min-width: 60px;
+    }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 15px;
+      margin-bottom: 20px;
+    }
+
+    .metric {
+      background: rgba(255, 255, 255, 0.05);
+      padding: 15px;
+      border-radius: 8px;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+    }
+
+    .metric-label {
+      font-size: 11px;
+      color: #a0aec0;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 8px;
+    }
+
+    .metric-value {
+      font-size: 16px;
+      font-weight: 700;
+      color: #e0e6ed;
+      word-break: break-all;
+    }
+
+    .log-box {
+      background: rgba(0, 0, 0, 0.3);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 8px;
+      padding: 15px;
+      font-family: "SF Mono", Monaco, "Cascadia Code", monospace;
+      font-size: 12px;
+      color: #6ee7b7;
+      max-height: 300px;
+      overflow-y: auto;
+      line-height: 1.6;
+    }
+
+    .log-line {
+      margin-bottom: 4px;
+    }
+
+    .empty-state {
+      text-align: center;
+      padding: 60px 20px;
+      color: #a0aec0;
+    }
+
+    .preview-frame {
+      width: 100%;
+      height: 600px;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 8px;
+      background: white;
+    }
+
+    .tab-btn {
+      background: transparent;
+      border: none;
+      color: #a0aec0;
+      cursor: pointer;
+      padding: 10px 0;
+      font-size: 13px;
+      font-weight: 600;
+      border-bottom: 2px solid transparent;
+      transition: all 0.2s;
+      margin-bottom: -15px;
+      padding-bottom: 15px;
+    }
+
+    .tab-btn:hover {
+      color: #e0e6ed;
+    }
+
+    .tab-btn.active {
+      color: #6366f1;
+      border-bottom-color: #6366f1;
+    }
+
+    .tab-content {
+      animation: fadeIn 0.2s;
+    }
+
+    .tab-content.active {
+      display: block;
+    }
+
+    @media (max-width: 1200px) {
+      main {
+        grid-template-columns: 1fr;
+      }
+      .config-panel {
+        position: static;
+      }
+      .metrics {
+        grid-template-columns: repeat(2, 1fr);
+      }
+    }
+
+    @media (max-width: 768px) {
+      .metrics {
+        grid-template-columns: 1fr;
+      }
+      .presets-list {
+        max-height: 400px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="inner">
+      <h1>✨ AI 文章创意工作室</h1>
+      <div class="status-badge" id="statusBadge">准备就绪</div>
+    </div>
+  </header>
+
+  <div class="container">
+    <main>
+      <div class="config-panel">
+        <h2>📝 生成配置</h2>
+
+        <button class="btn-secondary" id="generatePresetsBtn" style="margin-bottom: 25px;">
+          🔄 获取灵感预设
+        </button>
+
+        <div style="margin: 25px 0; padding: 20px 0; border-top: 1px solid rgba(255,255,255,0.1); border-bottom: 1px solid rgba(255,255,255,0.1);">
+          <div class="form-group">
+            <label>或输入创意描述</label>
+            <textarea id="ideaInput" placeholder="例如：AI如何改变工作方式"></textarea>
+          </div>
+          <button class="btn-secondary" id="completePresetBtn">
+            ✓ 完成创意
+          </button>
+        </div>
+
+        <div class="form-group">
+          <label>主题</label>
+          <textarea id="topicInput" placeholder="自动填入"></textarea>
+        </div>
+
+        <div class="form-group">
+          <label>目标读者</label>
+          <textarea id="audienceInput" placeholder="自动填入"></textarea>
+        </div>
+
+        <div class="form-group">
+          <label>语气风格</label>
+          <textarea id="toneInput" placeholder="自动填入"></textarea>
+        </div>
+
+        <div class="form-group">
+          <label>小节数</label>
+          <input id="sectionsInput" type="number" min="1" max="8" placeholder="3-4">
+        </div>
+
+        <div class="form-group">
+          <label>图片风格</label>
+          <textarea id="styleInput" placeholder="自动填入"></textarea>
+        </div>
+
+        <button id="generateBtn" style="margin-top: 20px;">
+          ▶️ 开始生成文章
+        </button>
+      </div>
+
+      <div class="content-area">
+        <div class="card">
+          <h2>📊 生成进度</h2>
+          <div class="metrics">
+            <div class="metric">
+              <div class="metric-label">任务ID</div>
+              <div class="metric-value" id="jobIdMetric">-</div>
+            </div>
+            <div class="metric">
+              <div class="metric-label">状态</div>
+              <div class="metric-value" id="statusMetric">-</div>
+            </div>
+            <div class="metric">
+              <div class="metric-label">标题</div>
+              <div class="metric-value" id="titleMetric" style="font-size: 13px;">-</div>
+            </div>
+            <div class="metric">
+              <div class="metric-label">图片数</div>
+              <div class="metric-value" id="imageCountMetric">-</div>
+            </div>
+          </div>
+
+          <div id="actionButtons" style="display: none; display: flex; gap: 10px; flex-wrap: wrap;">
+            <button class="btn-secondary" id="htmlBtn">📄 HTML</button>
+            <button class="btn-secondary" id="mdBtn">📝 Markdown</button>
+            <button class="btn-secondary" id="jsonBtn">📦 JSON</button>
+          </div>
+
+          <div id="emptyState" class="empty-state">
+            <p>等待生成...</p>
+          </div>
+        </div>
+
+        <div class="card">
+          <div style="display: flex; gap: 10px; margin-bottom: 20px; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 15px;">
+            <button class="tab-btn active" data-tab="presets">🎨 灵感预设</button>
+            <button class="tab-btn" data-tab="logs">📋 运行日志</button>
+            <button class="tab-btn" data-tab="preview">👁️ 页面预览</button>
+          </div>
+
+          <div id="presetsTab" class="tab-content active">
+            <div id="presetsLoading" style="text-align: center; padding: 40px; color: #a0aec0;">
+              点击上方按钮获取灵感预设
+            </div>
+            <div id="presetsContainer" style="display: none;">
+              <div class="presets-list" id="presetsList" style="max-height: 600px; overflow-y: auto;"></div>
+            </div>
+          </div>
+
+          <div id="logsTab" class="tab-content" style="display: none;">
+            <div class="log-box" id="logBox">
+              <div class="log-line" style="color: #a0aec0;">等待开始...</div>
+            </div>
+          </div>
+
+          <div id="previewTab" class="tab-content" style="display: none;">
+            <iframe id="previewFrame" class="preview-frame" title="article preview"></iframe>
+          </div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script>
+    const state = {
+      presets: [],
+      selectedPresetIndex: null,
+      jobId: null,
+      pollTimer: null,
+      lastLogIndex: 0
+    };
+
+    async function init() {
+      // No auto-loading of presets. User clicks "获取灵感预设" to generate them.
+      updateStatus('准备就绪');
+    }
+
+    function applyPreset(preset) {
+      document.getElementById('topicInput').value = preset.topic || '';
+      document.getElementById('audienceInput').value = preset.audience || '';
+      document.getElementById('toneInput').value = preset.tone || '';
+      document.getElementById('sectionsInput').value = preset.section_count || preset.sections || '';
+      document.getElementById('styleInput').value = preset.image_style || '';
+    }
+
+    document.getElementById('generatePresetsBtn').addEventListener('click', async () => {
+      updateStatus('生成灵感中...');
+      document.getElementById('generatePresetsBtn').disabled = true;
+      document.getElementById('presetsLoading').style.display = 'block';
+      document.getElementById('presetsContainer').style.display = 'none';
+
+      try {
+        const res = await fetch('/api/presets/generate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ brief: 'AI innovation and digital transformation', count: 6 })
+        });
+
+        const data = await res.json();
+        if (data.presets) {
+          state.presets = data.presets;
+          displayPresetsModal(data.presets);
+        }
+      } catch (err) {
+        alert('生成失败: ' + err.message);
+      } finally {
+        document.getElementById('generatePresetsBtn').disabled = false;
+        updateStatus('准备就绪');
+      }
+    });
+
+    function displayPresetsModal(presets) {
+      const list = document.getElementById('presetsList');
+      list.innerHTML = presets.map((p, i) => `
+        <div class="preset-card" data-index="${i}" onclick="selectPresetCard(${i})">
+          <div class="preset-card-name">${p.name}</div>
+          <div class="preset-card-info">
+            <div><strong>📌 主题:</strong> ${p.topic?.substring(0, 80)}...</div>
+            <div><strong>👥 读者:</strong> ${p.audience?.substring(0, 60)}...</div>
+            <div><strong>💬 语气:</strong> ${p.tone?.substring(0, 60)}...</div>
+            <div><strong>📄 小节:</strong> ${p.section_count}</div>
+          </div>
+        </div>
+      `).join('');
+
+      document.getElementById('presetsLoading').style.display = 'none';
+      document.getElementById('presetsContainer').style.display = 'block';
+
+      // Switch to presets tab
+      switchTab('presets');
+    }
+
+    function selectPresetCard(index) {
+      // Apply preset immediately
+      applyPreset(state.presets[index]);
+
+      // Highlight selected card
+      document.querySelectorAll('.preset-card').forEach((card, i) => {
+        card.classList.toggle('selected', i === index);
+      });
+    }
+
+    function switchTab(tabName) {
+      // Hide all tabs
+      document.querySelectorAll('.tab-content').forEach(el => {
+        el.classList.remove('active');
+        el.style.display = 'none';
+      });
+
+      // Remove active state from all buttons
+      document.querySelectorAll('.tab-btn').forEach(btn => {
+        btn.classList.remove('active');
+      });
+
+      // Show selected tab
+      const tabEl = document.getElementById(tabName + 'Tab');
+      if (tabEl) {
+        tabEl.classList.add('active');
+        tabEl.style.display = 'block';
+      }
+
+      // Activate button
+      document.querySelector(`[data-tab="${tabName}"]`)?.classList.add('active');
+    }
+
+    document.getElementById('completePresetBtn').addEventListener('click', async () => {
+      const idea = document.getElementById('ideaInput').value.trim();
+      if (!idea) {
+        alert('请输入创意描述');
+        return;
+      }
+
+      updateStatus('完成创意中...');
+      document.getElementById('completePresetBtn').disabled = true;
+
+      try {
+        const res = await fetch('/api/presets/complete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ idea })
+        });
+
+        const data = await res.json();
+        if (data.preset) {
+          applyPreset(data.preset);
+          document.getElementById('ideaInput').value = '';
+          alert('✓ 创意已自动补全');
+        }
+      } catch (err) {
+        alert('完成失败: ' + err.message);
+      } finally {
+        document.getElementById('completePresetBtn').disabled = false;
+        updateStatus('准备就绪');
+      }
+    });
+
+    document.getElementById('generateBtn').addEventListener('click', async () => {
+      const topic = document.getElementById('topicInput').value.trim();
+      if (!topic) {
+        alert('请输入主题');
+        return;
+      }
+
+      state.jobId = null;
+      updateStatus('生成中...');
+      clearLogs();
+      logMessage('📌 任务已创建，开始生成...');
+
+      document.getElementById('generateBtn').disabled = true;
+
+      try {
+        const payload = {
+          topic,
+          audience: document.getElementById('audienceInput').value,
+          tone: document.getElementById('toneInput').value,
+          sections: parseInt(document.getElementById('sectionsInput').value) || undefined,
+          image_style: document.getElementById('styleInput').value,
+          storage_mode: 'local'
+        };
+
+        const res = await fetch('/api/articles', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+
+        const job = await res.json();
+        if (job.job_id) {
+          state.jobId = job.job_id;
+          logMessage(`✓ Job ID: ${job.job_id}`);
+          pollStatus();
+        } else {
+          alert('创建任务失败');
+        }
+      } catch (err) {
+        alert('生成失败: ' + err.message);
+        updateStatus('准备就绪');
+        document.getElementById('generateBtn').disabled = false;
+      }
+    });
+
+    function pollStatus() {
+      if (!state.jobId) return;
+
+      fetch(`/api/jobs/${state.jobId}`)
+        .then(r => r.json())
+        .then(job => {
+          updateJobUI(job);
+
+          if (job.status === 'succeeded') {
+            updateStatus('✓ 完成');
+            document.getElementById('generateBtn').disabled = false;
+            logMessage('✓ 生成完成！');
+          } else if (job.status === 'failed') {
+            updateStatus('✗ 失败');
+            document.getElementById('generateBtn').disabled = false;
+            logMessage('✗ 生成失败: ' + (job.error || '未知错误'));
+          } else {
+            state.pollTimer = setTimeout(pollStatus, 1000);
+          }
+        })
+        .catch(err => {
+          logMessage('❌ 轮询失败: ' + err.message);
+          state.pollTimer = setTimeout(pollStatus, 2000);
+        });
+    }
+
+    function updateJobUI(job) {
+      document.getElementById('jobIdMetric').textContent = job.job_id?.substring(0, 20) + '...' || '-';
+      document.getElementById('statusMetric').textContent = {
+        'queued': '排队中',
+        'running': '生成中',
+        'succeeded': '✓ 成功',
+        'failed': '✗ 失败'
+      }[job.status] || job.status;
+
+      if (job.result) {
+        document.getElementById('titleMetric').textContent = job.result.title?.substring(0, 20) + '...' || '-';
+        document.getElementById('imageCountMetric').textContent = job.result.image_count || '-';
+
+        if (job.result.article_html) {
+          document.getElementById('previewFrame').src = job.result.article_html;
+          document.getElementById('previewCard').style.display = 'block';
+        }
+
+        const links = [];
+        if (job.result.article_html) links.push(['HTML', job.result.article_html]);
+        if (job.result.article_markdown) links.push(['Markdown', job.result.article_markdown]);
+        if (job.result.article_json) links.push(['JSON', job.result.article_json]);
+
+        if (links.length > 0) {
+          document.getElementById('htmlBtn').onclick = () => window.open(links[0][1], '_blank');
+          if (links[1]) document.getElementById('mdBtn').onclick = () => window.open(links[1][1], '_blank');
+          if (links[2]) document.getElementById('jsonBtn').onclick = () => window.open(links[2][1], '_blank');
+          document.getElementById('actionButtons').style.display = 'flex';
+          document.getElementById('emptyState').style.display = 'none';
+        }
+      }
+
+      if (job.logs && job.logs.length > state.lastLogIndex) {
+        // Only add new logs
+        for (let i = state.lastLogIndex; i < job.logs.length; i++) {
+          const log = job.logs[i];
+          const msg = typeof log === 'string' ? log : (log.message || JSON.stringify(log));
+          logMessage(msg);
+        }
+        state.lastLogIndex = job.logs.length;
+      }
+    }
+
+    function updateStatus(text) {
+      document.getElementById('statusBadge').textContent = text;
+    }
+
+    function clearLogs() {
+      document.getElementById('logBox').innerHTML = '';
+      state.lastLogIndex = 0;
+    }
+
+    function logMessage(msg) {
+      const box = document.getElementById('logBox');
+      const line = document.createElement('div');
+      line.className = 'log-line';
+      line.textContent = msg;
+      box.appendChild(line);
+      box.scrollTop = box.scrollHeight;
+    }
+
+    // Setup tab buttons
+    document.querySelectorAll('.tab-btn').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        switchTab(e.target.getAttribute('data-tab'));
+      });
+    });
+
+    init();
+  </script>
 </body>
 </html>
 """
@@ -1922,6 +3378,7 @@ def main() -> None:
     httpd = ThreadingHTTPServer((HOST, PORT), GrokWechatHandler)
     print(f"Grok WeChat Article Studio: http://{HOST}:{PORT}", flush=True)
     print("API: POST /api/articles, GET /api/jobs/{job_id}, GET /api/jobs/{job_id}/result", flush=True)
+    print(f"新 UI: http://{HOST}:{PORT}/ui", flush=True)
     httpd.serve_forever()
 
 

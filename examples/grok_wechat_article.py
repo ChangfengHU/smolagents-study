@@ -15,9 +15,11 @@ from __future__ import annotations
 """
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import mimetypes
 import os
+import random
 import re
 import time
 from dataclasses import asdict, dataclass
@@ -154,6 +156,131 @@ SCRIPT_TIMEOUT_SECONDS = 300
 SCRIPT_RETRY_ATTEMPTS = 2
 # SCRIPT_RETRY_BACKOFF_SECONDS: 每次重试前等待多久，后续会按次数递增。
 SCRIPT_RETRY_BACKOFF_SECONDS = 1.5
+# SCRIPT_IMAGE_MAX_CONCURRENCY: 图片并发生成上限。
+SCRIPT_IMAGE_MAX_CONCURRENCY = int(os.getenv("SCRIPT_IMAGE_MAX_CONCURRENCY", "6"))
+# SCRIPT_IMAGE_FALLBACK_MODELS: 主供应商（xAI）失败后的候选模型（逗号分隔）。
+SCRIPT_IMAGE_FALLBACK_MODELS = [
+    model.strip()
+    for model in os.getenv("SCRIPT_IMAGE_FALLBACK_MODELS", "grok-imagine-image-pro").split(",")
+    if model.strip()
+]
+# SCRIPT_IMAGE_FALLBACK_API_URL: 供应商兜底接口（统一生图 API）。
+SCRIPT_IMAGE_FALLBACK_API_URL = os.getenv("SCRIPT_IMAGE_FALLBACK_API_URL", "https://images.vyibc.com/api/v1beta/images:generate")
+# SCRIPT_IMAGE_FALLBACK_CANDIDATES: 兜底候选，格式 provider:model,provider:model...
+# 生图候选实测指标（2026-04-28，单轮基准，仅作排序参考）：
+# - grok:grok-imagine-image -> 8.08s (ok)
+# - vertex:imagen-4.0-generate-001 -> 21.93s (ok)
+# - vertex:imagen-4.0-fast-generate-001 -> 18.74s (ok)
+# - vertex:imagen-4.0-ultra-generate-001 -> 26.55s (ok)
+SCRIPT_IMAGE_FALLBACK_CANDIDATES = [
+    candidate.strip()
+    for candidate in os.getenv(
+        "SCRIPT_IMAGE_FALLBACK_CANDIDATES",
+        "grok:grok-imagine-image,vertex:imagen-4.0-generate-001,vertex:imagen-4.0-fast-generate-001,vertex:imagen-4.0-ultra-generate-001",
+    ).split(",")
+    if candidate.strip()
+]
+# SCRIPT_TEXT_GATEWAY_API_URL: 统一文本接口。
+SCRIPT_TEXT_GATEWAY_API_URL = os.getenv("SCRIPT_TEXT_GATEWAY_API_URL", "https://images.vyibc.com/api/v1beta/text:generate")
+# SCRIPT_TEXT_GATEWAY_CANDIDATES: 文本候选，格式 provider:model,provider:model...
+# 文本候选实测指标（2026-04-28，单轮基准，仅作排序参考）：
+# - grok:grok-4-fast-non-reasoning -> 8.17s (ok)
+# - vertex:gemini-2.5-flash -> 25.35s (ok)
+# - grok:grok-3-mini -> 27.12s (ok)
+# - grok:grok-3 -> 21.57s (ok)
+# - vertex:gemini-2.5-pro -> 23.17s (ok, 按用户 curl 复测)
+SCRIPT_TEXT_GATEWAY_CANDIDATES = [
+    candidate.strip()
+    for candidate in os.getenv(
+        "SCRIPT_TEXT_GATEWAY_CANDIDATES",
+        "grok:grok-4-fast-non-reasoning,vertex:gemini-2.5-flash,grok:grok-3-mini,grok:grok-3,vertex:gemini-2.5-pro",
+    ).split(",")
+    if candidate.strip()
+]
+# generation_profile: 生成策略（speed | balanced | quality），用于同时切换文本与生图候选优先级。
+SCRIPT_GENERATION_PROFILE = os.getenv("SCRIPT_GENERATION_PROFILE", "balanced").strip().lower()
+SCRIPT_GENERATION_PROFILES: dict[str, dict[str, list[str]]] = {
+    "speed": {
+        "text_candidates": [
+            "grok:grok-4-fast-non-reasoning",
+            "grok:grok-3-mini",
+            "vertex:gemini-2.5-flash",
+        ],
+        "image_candidates": [
+            "grok:grok-imagine-image",
+            "vertex:imagen-4.0-fast-generate-001",
+            "vertex:imagen-4.0-generate-001",
+        ],
+    },
+    "balanced": {
+        "text_candidates": [
+            "grok:grok-4-fast-non-reasoning",
+            "vertex:gemini-2.5-flash",
+            "grok:grok-3-mini",
+            "grok:grok-3",
+            "vertex:gemini-2.5-pro",
+        ],
+        "image_candidates": [
+            "grok:grok-imagine-image",
+            "vertex:imagen-4.0-fast-generate-001",
+            "vertex:imagen-4.0-generate-001",
+            "vertex:imagen-4.0-ultra-generate-001",
+        ],
+    },
+    "quality": {
+        "text_candidates": [
+            "vertex:gemini-2.5-pro",
+            "grok:grok-4-fast-non-reasoning",
+            "vertex:gemini-2.5-flash",
+        ],
+        "image_candidates": [
+            "vertex:imagen-4.0-ultra-generate-001",
+            "vertex:imagen-4.0-generate-001",
+            "grok:grok-imagine-image",
+        ],
+    },
+}
+# 与 generation_profile 对齐的提示词强度档位。
+SCRIPT_PROMPT_PROFILE = os.getenv("SCRIPT_PROMPT_PROFILE", "").strip().lower()
+TEXT_PROMPT_PROFILE_HINTS: dict[str, str] = {
+    "speed": (
+        "Prioritize concise output and strict schema compliance. "
+        "If trade-offs are needed, preserve JSON validity and section structure first."
+    ),
+    "balanced": (
+        "Balance readability and detail. Keep each section practical and avoid overlong digressions."
+    ),
+    "quality": (
+        "Prioritize depth, clarity, and narrative coherence. "
+        "Each section should include one concrete scenario and one actionable recommendation."
+    ),
+}
+IMAGE_PROMPT_PROFILE_SUFFIX: dict[str, str] = {
+    "speed": (
+        "clean composition, readable subject separation, no text overlay, no watermark, no logo"
+    ),
+    "balanced": (
+        "cinematic editorial style, natural lighting, consistent visual storytelling, "
+        "no text overlay, no watermark, no logo"
+    ),
+    "quality": (
+        "premium editorial quality, rich micro-details, physically plausible lighting, "
+        "natural textures, no text overlay, no watermark, no logo, no distorted hands"
+    ),
+}
+# 文本网关专项超时与重试（与 xAI 调用分离），用于缩短拥塞场景耗时。
+SCRIPT_TEXT_GATEWAY_TIMEOUT_SECONDS = int(os.getenv("SCRIPT_TEXT_GATEWAY_TIMEOUT_SECONDS", "45"))
+SCRIPT_TEXT_GATEWAY_RETRY_ATTEMPTS = int(os.getenv("SCRIPT_TEXT_GATEWAY_RETRY_ATTEMPTS", "1"))
+SCRIPT_TEXT_GATEWAY_RETRY_BACKOFF_SECONDS = float(os.getenv("SCRIPT_TEXT_GATEWAY_RETRY_BACKOFF_SECONDS", "1.0"))
+# 是否启用“直连 xAI 文本”最终兜底。默认关闭，以避免拥塞时长尾耗时。
+SCRIPT_TEXT_ENABLE_DIRECT_XAI_FALLBACK = os.getenv("SCRIPT_TEXT_ENABLE_DIRECT_XAI_FALLBACK", "false").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+# 统一生图接口的落地模式。local 由 images.vyibc.com 静态资源直接公网访问，通常更快。
+SCRIPT_IMAGE_GATEWAY_STORAGE_BACKEND = os.getenv("SCRIPT_IMAGE_GATEWAY_STORAGE_BACKEND", "local")
 # SCRIPT_STORAGE_MODE: 产物存储模式。local=仅本地输出，remote=上传 OSS 并替换引用。
 SCRIPT_STORAGE_MODE = os.getenv("GROK_WECHAT_STORAGE_MODE", "remote")
 # SCRIPT_OUTPUT_DIR: 输出目录。
@@ -266,6 +393,18 @@ class OSSConfig:
     public_base_url: str | None = None
 
 
+@dataclass(frozen=True)
+class ImageFallbackCandidate:
+    provider: str
+    model: str
+
+
+@dataclass(frozen=True)
+class TextGatewayCandidate:
+    provider: str
+    model: str
+
+
 class XAIHttpClient:
     """对 requests 的简单封装，统一处理鉴权、重试和下载。"""
 
@@ -298,6 +437,14 @@ class XAIHttpClient:
                 log_progress(f"HTTP {response.status_code} from {path}")
                 data = _decode_json(response)
                 if response.status_code >= 400:
+                    if _is_retryable_http_status(response.status_code) and attempt < self.config.retry_attempts:
+                        backoff_seconds = self.config.retry_backoff_seconds * attempt + random.uniform(0.2, 0.8)
+                        log_progress(
+                            f"HTTP {response.status_code} from {path}, retrying after {backoff_seconds:.1f}s "
+                            f"(attempt {attempt}/{self.config.retry_attempts})"
+                        )
+                        time.sleep(backoff_seconds)
+                        continue
                     raise XAIAPIError(_format_http_error(response.status_code, data))
                 if isinstance(data, dict) and data.get("error"):
                     raise XAIAPIError(f"xAI API error: {data['error']}")
@@ -521,11 +668,144 @@ class XAITextGenerationTool:
         }
 
 
+class UnifiedTextGenerationTool:
+    """通过统一文本接口生成文章草稿，直连 xAI 仅作为兜底。"""
+
+    def __init__(
+        self,
+        api_url: str,
+        candidates: list[TextGatewayCandidate],
+        timeout_seconds: int,
+        retry_attempts: int,
+        retry_backoff_seconds: float,
+        prompt_profile: str,
+        fallback_tool: XAITextGenerationTool | None = None,
+    ):
+        self.api_url = api_url
+        self.candidates = candidates
+        self.timeout_seconds = timeout_seconds
+        self.retry_attempts = retry_attempts
+        self.retry_backoff_seconds = retry_backoff_seconds
+        self.prompt_profile = prompt_profile
+        self.fallback_tool = fallback_tool
+
+    def generate_article_draft(self, request: ArticleRequest) -> ArticleDraft:
+        """并发竞速文本候选，谁先成功返回就用谁。"""
+
+        tasks: list[tuple[str, Any]] = []
+        for candidate in self.candidates:
+            task_name = f"gateway:{candidate.provider}/{candidate.model}"
+            tasks.append((task_name, lambda c=candidate: self._generate_via_gateway_candidate(c, request)))
+
+        if self.fallback_tool is not None:
+            tasks.append(("direct_xai", lambda: self._generate_via_direct_xai(request)))
+
+        if not tasks:
+            raise XAIAPIError("No text generation backend configured.")
+
+        errors: list[str] = []
+        with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
+            future_to_name = {executor.submit(task_fn): task_name for task_name, task_fn in tasks}
+            for future in as_completed(future_to_name):
+                task_name = future_to_name[future]
+                try:
+                    draft = future.result()
+                    log_progress(f"Article draft winner: {task_name}")
+                    return draft
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"{task_name}:{exc}")
+                    log_progress(f"Text candidate failed: {task_name}: {exc}")
+
+        raise XAIAPIError("All text generation backends failed: " + " | ".join(errors[-10:]))
+
+    def _generate_via_gateway_candidate(self, candidate: TextGatewayCandidate, request: ArticleRequest) -> ArticleDraft:
+        prompt = self._build_gateway_prompt(request, self.prompt_profile)
+        for attempt in range(1, self.retry_attempts + 1):
+            log_progress(
+                f"Generating article draft via text gateway {candidate.provider}/{candidate.model} "
+                f"(attempt {attempt}/{self.retry_attempts})"
+            )
+            try:
+                response = requests.post(
+                    self.api_url,
+                    headers={"Content-Type": "application/json"},
+                    json={
+                        "provider": candidate.provider,
+                        "model": candidate.model,
+                        "prompt": prompt,
+                    },
+                    timeout=self.timeout_seconds,
+                )
+                data = _decode_json(response)
+                if response.status_code >= 400:
+                    if _is_retryable_http_status(response.status_code) and attempt < self.retry_attempts:
+                        backoff_seconds = self.retry_backoff_seconds * attempt + random.uniform(0.2, 0.8)
+                        log_progress(
+                            f"Text gateway HTTP {response.status_code}, retrying after {backoff_seconds:.1f}s "
+                            f"for {candidate.provider}/{candidate.model}"
+                        )
+                        time.sleep(backoff_seconds)
+                        continue
+                    raise XAIAPIError(_format_http_error(response.status_code, data))
+
+                raw_text = data.get("text") if isinstance(data, dict) else None
+                if not isinstance(raw_text, str) or not raw_text.strip():
+                    raise XAIAPIError(f"Text gateway response missing text: {data}")
+                article_data = json.loads(_strip_json_fences(raw_text))
+                draft = ArticleDraft.from_dict(article_data, expected_sections=request.sections)
+                log_progress(f"Article draft generated via text gateway: {candidate.provider}/{candidate.model}")
+                return draft
+            except Exception:
+                if attempt >= self.retry_attempts:
+                    raise
+        raise XAIAPIError(f"Text gateway candidate exhausted retries: {candidate.provider}/{candidate.model}")
+
+    def _generate_via_direct_xai(self, request: ArticleRequest) -> ArticleDraft:
+        if self.fallback_tool is None:
+            raise XAIAPIError("Direct xAI tool is not configured.")
+        log_progress("Generating article draft via direct xAI API (race candidate)")
+        return self.fallback_tool.generate_article_draft(request)
+
+    @staticmethod
+    def _build_gateway_prompt(request: ArticleRequest, prompt_profile: str) -> str:
+        schema = XAITextGenerationTool._build_schema(request.sections)
+        quality_hint = TEXT_PROMPT_PROFILE_HINTS.get(prompt_profile, TEXT_PROMPT_PROFILE_HINTS["balanced"])
+        return (
+            f"{XAITextGenerationTool._build_system_prompt()}\n\n"
+            f"{XAITextGenerationTool._build_user_prompt(request)}\n\n"
+            f"Generation profile: {prompt_profile}\n"
+            f"Extra guidance: {quality_hint}\n"
+            "Output safety rules:\n"
+            "- Return ONLY one JSON object, no markdown fences, no preface.\n"
+            "- Keep intro_paragraphs 1-2 items; conclusion_paragraphs 1-2 items.\n"
+            "- Keep each section paragraphs at 2-3 and bullets at 3-5.\n"
+            "- If uncertain, avoid fabricated statistics and named reports.\n\n"
+            "Return exactly one valid JSON object. Do not wrap it in markdown fences. "
+            "The JSON object must match this JSON Schema exactly:\n"
+            f"{json.dumps(schema, ensure_ascii=False)}"
+        )
+
+
 class XAIImageGenerationTool:
     """负责“根据提示词生成图片”这一步。"""
 
-    def __init__(self, client: XAIHttpClient):
+    def __init__(
+        self,
+        client: XAIHttpClient,
+        fallback_api_url: str = SCRIPT_IMAGE_FALLBACK_API_URL,
+        fallback_candidates: list[ImageFallbackCandidate] | None = None,
+        xai_fallback_models: list[str] | None = None,
+        gateway_storage_backend: str = SCRIPT_IMAGE_GATEWAY_STORAGE_BACKEND,
+        prompt_profile: str = "balanced",
+    ):
         self.client = client
+        self.fallback_api_url = fallback_api_url
+        self.fallback_candidates = fallback_candidates or []
+        self.xai_fallback_models = xai_fallback_models or []
+        self.gateway_storage_backend = gateway_storage_backend
+        self.prompt_profile = prompt_profile
+        self.fallback_session = requests.Session()
+        self.fallback_session.headers.update({"Content-Type": "application/json"})
 
     def generate_image(
         self,
@@ -539,8 +819,71 @@ class XAIImageGenerationTool:
         """调用生图接口并把图片下载到本地。"""
 
         log_progress(f"Generating image: {destination.name}")
+        tuned_prompt = self._enhance_image_prompt(prompt, aspect_ratio, resolution)
+        source_url: str | None = None
+        revised_prompt: str | None = None
+        errors: list[str] = []
+
+        if self.fallback_candidates:
+            source_url = self._generate_image_url_via_fallback_service(tuned_prompt, aspect_ratio, resolution, errors)
+
+        xai_models = (
+            [self.client.config.image_model] + [m for m in self.xai_fallback_models if m != self.client.config.image_model]
+            if self.client.config.api_key
+            else []
+        )
+        if not source_url:
+            for model_id in xai_models:
+                try:
+                    source_url, revised_prompt = self._generate_image_url_via_xai(
+                        model_id=model_id,
+                        prompt=tuned_prompt,
+                        aspect_ratio=aspect_ratio,
+                        resolution=resolution,
+                    )
+                    if source_url:
+                        break
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"xai:{model_id}:{exc}")
+                    log_progress(f"xAI image generation failed for model={model_id}: {exc}")
+
+        if not source_url:
+            raise XAIAPIError("All image generation backends failed: " + " | ".join(errors[-8:]))
+
+        # 生图接口返回的是远程 URL，这里额外下载到本地，方便 markdown/html 直接引用。
+        local_file = self.client.download_binary(source_url, destination)
+        log_progress(f"Image ready: {destination.name}")
+        return GeneratedImage(
+            prompt=tuned_prompt,
+            source_url=source_url,
+            alt_text=alt_text,
+            caption=caption,
+            revised_prompt=revised_prompt,
+            local_path=local_file.name if local_file.parent == destination.parent else str(local_file),
+        )
+
+    def _enhance_image_prompt(self, prompt: str, aspect_ratio: str, resolution: str) -> str:
+        """把草稿里的图片描述增强为稳定可执行的生图提示词。"""
+
+        base_prompt = " ".join(prompt.split())
+        suffix = IMAGE_PROMPT_PROFILE_SUFFIX.get(self.prompt_profile, IMAGE_PROMPT_PROFILE_SUFFIX["balanced"])
+        if "no text overlay" in base_prompt.lower():
+            # 已经有关键约束时，避免重复太多。
+            return f"{base_prompt}, aspect ratio {aspect_ratio}, resolution {resolution}, {suffix}"
+        return (
+            f"{base_prompt}, aspect ratio {aspect_ratio}, resolution {resolution}, "
+            f"{suffix}, no text overlay"
+        )
+
+    def _generate_image_url_via_xai(
+        self,
+        model_id: str,
+        prompt: str,
+        aspect_ratio: str,
+        resolution: str,
+    ) -> tuple[str, str | None]:
         payload = {
-            "model": self.client.config.image_model,
+            "model": model_id,
             "prompt": prompt,
             "aspect_ratio": aspect_ratio,
             "resolution": resolution,
@@ -550,18 +893,61 @@ class XAIImageGenerationTool:
         source_url = image_data.get("url")
         if not source_url:
             raise XAIAPIError(f"Image generation response did not include a URL: {image_data}")
+        return source_url, image_data.get("revised_prompt")
 
-        # 生图接口返回的是远程 URL，这里额外下载到本地，方便 markdown/html 直接引用。
-        local_file = self.client.download_binary(source_url, destination)
-        log_progress(f"Image ready: {destination.name}")
-        return GeneratedImage(
-            prompt=prompt,
-            source_url=source_url,
-            alt_text=alt_text,
-            caption=caption,
-            revised_prompt=image_data.get("revised_prompt"),
-            local_path=local_file.name if local_file.parent == destination.parent else str(local_file),
-        )
+    def _generate_image_url_via_fallback_service(
+        self,
+        prompt: str,
+        aspect_ratio: str,
+        resolution: str,
+        errors: list[str],
+    ) -> str | None:
+        for candidate in self.fallback_candidates:
+            for attempt in range(1, self.client.config.retry_attempts + 1):
+                try:
+                    payload: dict[str, Any] = {
+                        "provider": candidate.provider,
+                        "model": candidate.model,
+                        "n": 1,
+                        "prompt": prompt,
+                        "storage_backend": self.gateway_storage_backend,
+                    }
+                    if candidate.provider == "grok":
+                        payload["aspectRatio"] = aspect_ratio
+                        payload["resolution"] = resolution
+                    elif candidate.provider == "vertex":
+                        payload["parameters"] = {"aspectRatio": _normalize_vertex_aspect_ratio(aspect_ratio)}
+
+                    log_progress(
+                        f"Image gateway generation via {candidate.provider}/{candidate.model} "
+                        f"(attempt {attempt}/{self.client.config.retry_attempts})"
+                    )
+                    response = self.fallback_session.post(
+                        self.fallback_api_url,
+                        json=payload,
+                        timeout=self.client.config.timeout_seconds,
+                    )
+                    data = _decode_json(response)
+                    if response.status_code >= 400:
+                        if _is_retryable_http_status(response.status_code) and attempt < self.client.config.retry_attempts:
+                            backoff_seconds = self.client.config.retry_backoff_seconds * attempt + random.uniform(0.2, 0.8)
+                            log_progress(
+                                f"Fallback HTTP {response.status_code}, retrying after {backoff_seconds:.1f}s "
+                                f"for {candidate.provider}/{candidate.model}"
+                            )
+                            time.sleep(backoff_seconds)
+                            continue
+                        raise XAIAPIError(_format_http_error(response.status_code, data))
+                    image_urls = data.get("image_urls") if isinstance(data, dict) else None
+                    if isinstance(image_urls, list) and image_urls and isinstance(image_urls[0], str):
+                        return image_urls[0]
+                    raise XAIAPIError(f"Fallback response missing image_urls: {data}")
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"fallback:{candidate.provider}:{candidate.model}:{exc}")
+                    if attempt == self.client.config.retry_attempts:
+                        log_progress(f"Fallback failed for {candidate.provider}/{candidate.model}: {exc}")
+                        break
+        return None
 
 
 class WeChatArticleComposer:
@@ -593,31 +979,50 @@ class WeChatArticleComposer:
         self._write_draft_files(output_dir, request, draft)
         log_progress(f"Draft markdown saved: {output_dir / 'draft.md'}")
         log_progress(f"Draft json saved: {output_dir / 'draft.json'}")
-        # 第二步：为封面图生成图片。
-        log_progress("Generating cover image")
-        cover_image = self.image_tool.generate_image(
-            prompt=draft.cover_image_prompt,
-            alt_text=draft.cover_image_alt,
-            caption=draft.subtitle,
-            aspect_ratio=request.aspect_ratio,
-            resolution=request.resolution,
-            destination=images_dir / "cover",
-        )
-
-        # 第三步：为每个正文小节各生成一张配图。
-        section_images: list[GeneratedImage] = []
+        # 第二步：并发生成封面图 + 正文配图，提升吞吐并降低单次失败影响面。
+        image_jobs: list[tuple[str, dict[str, Any]]] = [
+            (
+                "cover",
+                {
+                    "prompt": draft.cover_image_prompt,
+                    "alt_text": draft.cover_image_alt,
+                    "caption": draft.subtitle,
+                    "aspect_ratio": request.aspect_ratio,
+                    "resolution": request.resolution,
+                    "destination": images_dir / "cover",
+                },
+            )
+        ]
         for index, section in enumerate(draft.sections, start=1):
-            log_progress(f"Generating section image {index}/{len(draft.sections)}")
-            section_images.append(
-                self.image_tool.generate_image(
-                    prompt=section.image_prompt,
-                    alt_text=section.image_alt,
-                    caption=section.image_caption,
-                    aspect_ratio=request.aspect_ratio,
-                    resolution=request.resolution,
-                    destination=images_dir / f"section-{index:02d}",
+            image_jobs.append(
+                (
+                    f"section-{index:02d}",
+                    {
+                        "prompt": section.image_prompt,
+                        "alt_text": section.image_alt,
+                        "caption": section.image_caption,
+                        "aspect_ratio": request.aspect_ratio,
+                        "resolution": request.resolution,
+                        "destination": images_dir / f"section-{index:02d}",
+                    },
                 )
             )
+
+        max_workers = max(1, min(SCRIPT_IMAGE_MAX_CONCURRENCY, len(image_jobs)))
+        log_progress(f"Generating {len(image_jobs)} images concurrently (workers={max_workers})")
+        image_results: dict[str, GeneratedImage] = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {
+                executor.submit(self.image_tool.generate_image, **job_kwargs): job_name
+                for job_name, job_kwargs in image_jobs
+            }
+            for future in as_completed(future_map):
+                job_name = future_map[future]
+                image_results[job_name] = future.result()
+                log_progress(f"Image generation completed: {job_name}")
+
+        cover_image = image_results["cover"]
+        section_images = [image_results[f"section-{index:02d}"] for index in range(1, len(draft.sections) + 1)]
 
         # 第四步：把最终内容分别渲染成 markdown 和 html。
         log_progress("Rendering markdown and html")
@@ -1118,6 +1523,24 @@ def _format_http_error(status_code: int, payload: dict[str, Any]) -> str:
     return f"xAI API request failed with status {status_code}: {message}"
 
 
+def _is_retryable_http_status(status_code: int) -> bool:
+    return status_code in {429, 500, 502, 503, 504}
+
+
+def _strip_json_fences(text: str) -> str:
+    cleaned = text.strip()
+    if not cleaned.startswith("```"):
+        return cleaned
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    return cleaned.strip()
+
+
+def _normalize_vertex_aspect_ratio(aspect_ratio: str) -> str:
+    allowed = {"1:1", "3:4", "4:3", "9:16", "16:9"}
+    return aspect_ratio if aspect_ratio in allowed else "16:9"
+
+
 def _guess_image_extension(url: str, content_type: str) -> str:
     """根据 Content-Type 或 URL 猜测图片后缀名。"""
 
@@ -1230,6 +1653,7 @@ def generate_wechat_article(
     aspect_ratio: str | None = None,
     resolution: str | None = None,
     storage_mode: str | None = None,
+    generation_profile: str | None = None,
 ) -> ArticleBundle:
     """Generate a complete WeChat article bundle.
 
@@ -1258,6 +1682,7 @@ def generate_wechat_article(
     image_model = os.getenv("XAI_IMAGE_MODEL", SCRIPT_IMAGE_MODEL)
     output_dir_value = output_dir or (Path(SCRIPT_OUTPUT_DIR) if SCRIPT_OUTPUT_DIR else None)
     selected_storage_mode = (storage_mode or SCRIPT_STORAGE_MODE).strip().lower()
+    selected_generation_profile = (generation_profile or SCRIPT_GENERATION_PROFILE).strip().lower()
 
     # 启动时先打印关键配置，方便排查“到底连的是谁、Key 有没有读到”。
     log_progress(f"Using xAI base URL: {base_url.rstrip('/')}")
@@ -1273,12 +1698,13 @@ def generate_wechat_article(
     # 先做最基本的输入校验，尽量在真正调用接口前就发现问题。
     if not selected_topic:
         raise SystemExit("Missing topic in selected preset. Update the preset json file.")
-    if not api_key:
-        raise SystemExit("Missing xAI API key. Set XAI_API_KEY or pass --api-key.")
     if request.sections < 1:
         raise SystemExit("Preset section_count must be at least 1.")
     if selected_storage_mode not in {"local", "remote"}:
         raise SystemExit("storage_mode must be either 'local' or 'remote'.")
+    if selected_generation_profile not in SCRIPT_GENERATION_PROFILES:
+        supported_profiles = ", ".join(sorted(SCRIPT_GENERATION_PROFILES))
+        raise SystemExit(f"generation_profile must be one of: {supported_profiles}.")
     # 如果你没有手写输出目录，就自动按主题创建一个新目录。
     target_output_dir = Path(output_dir_value) if output_dir_value else build_default_output_dir(selected_topic)
 
@@ -1293,6 +1719,13 @@ def generate_wechat_article(
         retry_backoff_seconds=SCRIPT_RETRY_BACKOFF_SECONDS,
     )
     client = XAIHttpClient(config)
+    direct_xai_text_tool = (
+        XAITextGenerationTool(client) if api_key and SCRIPT_TEXT_ENABLE_DIRECT_XAI_FALLBACK else None
+    )
+    if not api_key:
+        log_progress("xAI API key missing: direct xAI fallback is disabled, unified gateway remains enabled")
+    elif not SCRIPT_TEXT_ENABLE_DIRECT_XAI_FALLBACK:
+        log_progress("Direct xAI text fallback disabled: use unified text gateway candidates only")
     oss_uploader = None
     if selected_storage_mode == "remote":
         oss_config = resolve_oss_config()
@@ -1304,9 +1737,34 @@ def generate_wechat_article(
         log_progress(f"Storage mode: remote (OSS bucket={oss_config.bucket_name}, endpoint={oss_config.endpoint})")
     else:
         log_progress("Storage mode: local (skip OSS upload and URL rewrite)")
+    profile = SCRIPT_GENERATION_PROFILES[selected_generation_profile]
+    selected_prompt_profile = SCRIPT_PROMPT_PROFILE or selected_generation_profile
+    text_candidates = resolve_text_gateway_candidates(profile["text_candidates"])
+    image_candidates = resolve_image_fallback_candidates(profile["image_candidates"])
+    log_progress(
+        f"Generation profile: {selected_generation_profile} "
+        f"(text={','.join(f'{item.provider}:{item.model}' for item in text_candidates)}; "
+        f"image={','.join(f'{item.provider}:{item.model}' for item in image_candidates)})"
+    )
+    log_progress(f"Prompt profile: {selected_prompt_profile}")
     composer = WeChatArticleComposer(
-        text_tool=XAITextGenerationTool(client),
-        image_tool=XAIImageGenerationTool(client),
+        text_tool=UnifiedTextGenerationTool(
+            api_url=SCRIPT_TEXT_GATEWAY_API_URL,
+            candidates=text_candidates,
+            timeout_seconds=SCRIPT_TEXT_GATEWAY_TIMEOUT_SECONDS,
+            retry_attempts=SCRIPT_TEXT_GATEWAY_RETRY_ATTEMPTS,
+            retry_backoff_seconds=SCRIPT_TEXT_GATEWAY_RETRY_BACKOFF_SECONDS,
+            prompt_profile=selected_prompt_profile,
+            fallback_tool=direct_xai_text_tool,
+        ),
+        image_tool=XAIImageGenerationTool(
+            client,
+            fallback_api_url=SCRIPT_IMAGE_FALLBACK_API_URL,
+            fallback_candidates=image_candidates,
+            xai_fallback_models=SCRIPT_IMAGE_FALLBACK_MODELS if api_key else [],
+            gateway_storage_backend=SCRIPT_IMAGE_GATEWAY_STORAGE_BACKEND,
+            prompt_profile=selected_prompt_profile,
+        ),
         oss_uploader=oss_uploader,
     )
     # 这里开始真正生成文章、图片和输出文件。
@@ -1386,6 +1844,40 @@ def resolve_oss_config() -> OSSConfig | None:
         key_prefix=key_prefix,
         public_base_url=public_base_url,
     )
+
+
+def resolve_image_fallback_candidates(raw_candidates: list[str] | None = None) -> list[ImageFallbackCandidate]:
+    """解析生图兜底候选列表。"""
+
+    candidates: list[ImageFallbackCandidate] = []
+    source = raw_candidates if raw_candidates is not None else SCRIPT_IMAGE_FALLBACK_CANDIDATES
+    for raw in source:
+        if ":" not in raw:
+            continue
+        provider, model = raw.split(":", 1)
+        provider = provider.strip().lower()
+        model = model.strip()
+        if not provider or not model:
+            continue
+        candidates.append(ImageFallbackCandidate(provider=provider, model=model))
+    return candidates
+
+
+def resolve_text_gateway_candidates(raw_candidates: list[str] | None = None) -> list[TextGatewayCandidate]:
+    """解析统一文本接口候选列表。"""
+
+    candidates: list[TextGatewayCandidate] = []
+    source = raw_candidates if raw_candidates is not None else SCRIPT_TEXT_GATEWAY_CANDIDATES
+    for raw in source:
+        if ":" not in raw:
+            continue
+        provider, model = raw.split(":", 1)
+        provider = provider.strip().lower()
+        model = model.strip()
+        if not provider or not model:
+            continue
+        candidates.append(TextGatewayCandidate(provider=provider, model=model))
+    return candidates
 
 
 if __name__ == "__main__":
