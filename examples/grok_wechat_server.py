@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 """HTTP console for the Grok WeChat article generator.
 
 Run:
@@ -24,7 +25,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import unquote, urlparse
 
 import grok_wechat_article as generator
 
@@ -196,6 +197,10 @@ def coerce_article_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "resolution": str,
         "storage_mode": str,
         "generation_profile": str,
+        "outline": str,
+        "story_type": str,
+        "reference_image_url": str,  # 参考图片 URL，用于保持人物/场景一致性
+        "reference_character_profile": str,
     }
     options: dict[str, Any] = {"preset_index": preset_index}
     for key, expected_type in allowed_optional_fields.items():
@@ -213,13 +218,30 @@ def coerce_article_payload(payload: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"{key} must be a string.")
         if key == "storage_mode":
             value = value.strip().lower()
-            if value not in {"local", "remote"}:
-                raise ValueError("storage_mode must be either 'local' or 'remote'.")
+            if value not in {"local", "remote", "r2", "oss"}:
+                raise ValueError("storage_mode must be one of: local, remote, r2, oss.")
         if key == "generation_profile":
             value = value.strip().lower()
             if value not in {"speed", "balanced", "quality"}:
                 raise ValueError("generation_profile must be one of: speed, balanced, quality.")
+        if key == "story_type":
+            value = value.strip().lower()
+            if value not in {"informative", "story", "how-to", "listicle", "analysis"}:
+                raise ValueError("story_type must be one of: informative, story, how-to, listicle, analysis.")
         options[key] = value
+
+    # key_points handling (list type)
+    if "key_points" in payload and payload["key_points"] is not None:
+        key_points = payload["key_points"]
+        if isinstance(key_points, str):
+            key_points = [p.strip() for p in key_points.split(",") if p.strip()]
+        elif not isinstance(key_points, list):
+            raise ValueError("key_points must be a list or comma-separated string")
+        else:
+            key_points = [str(point).strip() for point in key_points if str(point).strip()]
+        if key_points:
+            options["key_points"] = key_points
+
     return options
 
 
@@ -322,7 +344,7 @@ def _ensure_chinese_preset_fields(preset: dict[str, Any]) -> dict[str, Any]:
     try:
         rewritten = _call_text_generation_api(
             rewrite_prompt,
-            model_priority=[("grok", "grok-4-fast-non-reasoning"), ("vertex", "gemini-2.5-flash")],
+            model_priority=[("vertex", "gemini-2.5-flash"), ("grok", "grok-4-fast-non-reasoning")],
             race_mode=True,
         )
         data = json.loads(rewritten)
@@ -360,7 +382,7 @@ def _rewrite_field_to_chinese(field: str, value: str, preset: dict[str, Any]) ->
     try:
         text = _call_text_generation_api(
             prompt,
-            model_priority=[("grok", "grok-4-fast-non-reasoning"), ("vertex", "gemini-2.5-flash")],
+            model_priority=[("vertex", "gemini-2.5-flash"), ("grok", "grok-4-fast-non-reasoning")],
             race_mode=False,
         ).strip()
         if text and _is_mostly_chinese(text):
@@ -386,6 +408,169 @@ def build_xai_client(timeout_seconds: int = 180) -> generator.XAIHttpClient:
             retry_backoff_seconds=generator.SCRIPT_RETRY_BACKOFF_SECONDS,
         )
     )
+
+
+def expand_idea_to_full_params(payload: dict[str, Any]) -> dict[str, Any]:
+    """Convert user idea to full article generation parameters including outline, key_points, story_type."""
+    idea = payload.get("idea")
+    reference_image_url = payload.get("reference_image_url")  # 从payload提取参考图
+    if not isinstance(idea, str) or not idea.strip():
+        raise ValueError("idea is required and must be a non-empty string.")
+
+    system_prompt = """你是一个中文内容策划专家。你必须用中文思考和回复。
+
+你的任务：将用户的想法扩展成完整的文章生成计划。
+
+返回JSON对象（必须包含这些字段）：
+{
+  "topic": "用中文写的具体文章主题",
+  "audience": "用中文描述的目标受众",
+  "tone": "用中文描述的文章风格和语调",
+  "sections": 4,
+  "outline": "用中文写的结构化大纲，格式：1. 章节标题 2. 章节标题 3. 章节标题 4. 章节标题",
+  "key_points": ["用中文写的要点1", "用中文写的要点2", "用中文写的要点3"],
+  "story_type": "how-to|story|listicle|analysis|informative",
+  "needs_reference_image": true/false,
+  "reference_image_guidance": "如果需要参考图，请给出建议，否则留空",
+  "use_web_search": false,
+  "image_style": "visual style in English",
+  "aspect_ratio": "16:9|1:1|3:4",
+  "resolution": "1k|2k"
+}
+
+严格要求：
+- topic 必须用中文
+- audience 必须用中文
+- tone 必须用中文
+- outline 必须用中文，格式为 "1. xxx 2. xxx 3. xxx 4. xxx"
+- key_points 中的每一项都必须用中文
+- needs_reference_image: 判断该内容是否需要参考图来保持视觉/人物一致性
+  * true 如果内容涉及：具体人物、个人成长故事、人物形象、视觉场景的连贯性
+  * false 如果内容是：纯教程、列表、分析、知识分享等不涉及具体人物的内容
+- reference_image_guidance: 如果 needs_reference_image=true，提供参考图的使用建议（中文）
+- 只返回JSON，不要任何其他文本"""
+
+    generator.log_progress("Expanding idea to full parameters (Chinese)...")
+
+    # 强制用中文回答：提供中文JSON范例
+    full_prompt = f"""{system_prompt}
+
+用户想法：
+{idea.strip()}
+
+请按照以下JSON格式用中文回答（topic, audience, tone, outline, key_points 必须是中文）：
+
+示例格式：
+{{
+  "topic": "中文标题示例",
+  "audience": "中文受众描述示例",
+  "tone": "中文风格描述示例",
+  "sections": 4,
+  "outline": "1. 中文章节标题 2. 中文章节标题 3. 中文章节标题 4. 中文章节标题",
+  "key_points": ["中文要点示例1", "中文要点示例2", "中文要点示例3"],
+  "story_type": "how-to",
+  "use_web_search": false,
+  "image_style": "visual style in English",
+  "aspect_ratio": "16:9",
+  "resolution": "2k"
+}}
+
+现在请根据用户想法生成JSON（必须用中文！）："""
+
+    response_text = _call_text_generation_api(full_prompt, race_mode=True)
+
+    try:
+        data = json.loads(response_text)
+    except json.JSONDecodeError:
+        if "```json" in response_text:
+            json_str = response_text.split("```json")[1].split("```")[0].strip()
+            data = json.loads(json_str)
+        elif "```" in response_text:
+            json_str = response_text.split("```")[1].split("```")[0].strip()
+            data = json.loads(json_str)
+        else:
+            raise ValueError(f"Response was not valid JSON: {response_text[:500]}")
+
+    # Validate required fields
+    required = ["topic", "audience", "tone", "sections", "outline", "key_points", "story_type"]
+    for field in required:
+        if field not in data:
+            raise ValueError(f"Missing required field: {field}")
+
+    # Ensure key_points is a list
+    if isinstance(data["key_points"], str):
+        data["key_points"] = [p.strip() for p in data["key_points"].split(",")]
+    if not isinstance(data["key_points"], list):
+        raise ValueError("key_points must be a list of strings")
+
+    # Set defaults for optional fields
+    data.setdefault("use_web_search", False)
+    data.setdefault("image_style", "professional illustration, clean composition, no text overlay")
+    data.setdefault("aspect_ratio", "16:9")
+    data.setdefault("resolution", "2k")
+
+    # 强制中文化：确保关键字段都是中文
+    chinese_fields = ["topic", "audience", "tone", "outline"]
+    for field in chinese_fields:
+        value = str(data.get(field, "")).strip()
+        if value and not _is_mostly_chinese(value):
+            generator.log_progress(f"Field '{field}' is not Chinese, attempting to rewrite...")
+            rewritten = _rewrite_field_to_chinese(field, value, data)
+            if rewritten:
+                data[field] = rewritten
+            else:
+                generator.log_progress(f"Warning: Failed to rewrite '{field}' to Chinese")
+
+    # 强制中文化 key_points
+    if isinstance(data["key_points"], list):
+        rewritten_points = []
+        for i, point in enumerate(data["key_points"]):
+            point_str = str(point).strip()
+            if point_str and not _is_mostly_chinese(point_str):
+                generator.log_progress(f"Key point {i} is not Chinese, attempting to rewrite...")
+                prompt = (
+                    f"请把下面的要点改写为简体中文，保留原意：\n"
+                    f"原文：{point_str}\n"
+                    f"要求：只输出改写后的中文文本，不要引号，不要解释。"
+                )
+                try:
+                    rewritten = _call_text_generation_api(
+                        prompt,
+                        model_priority=[("vertex", "gemini-2.5-flash"), ("grok", "grok-4-fast-non-reasoning")],
+                        race_mode=False,
+                    ).strip()
+                    if rewritten and _is_mostly_chinese(rewritten):
+                        point_str = rewritten
+                except Exception as exc:  # noqa: BLE001
+                    generator.log_progress(f"Key point {i} rewrite failed: {exc}")
+            rewritten_points.append(point_str)
+        data["key_points"] = rewritten_points
+
+    result = {
+        "topic": data["topic"],
+        "audience": data["audience"],
+        "tone": data["tone"],
+        "sections": int(data["sections"]),
+        "outline": data["outline"],
+        "key_points": data["key_points"],
+        "story_type": data.get("story_type", "informative"),
+        "needs_reference_image": bool(data.get("needs_reference_image", False)),
+        "reference_image_guidance": data.get("reference_image_guidance", ""),
+        "use_web_search": bool(data.get("use_web_search", False)),
+        "image_style": data.get("image_style", "professional illustration, clean composition, no text overlay"),
+        "aspect_ratio": data.get("aspect_ratio", "16:9"),
+        "resolution": data.get("resolution", "2k"),
+    }
+
+    # 添加参考图支持（可选）
+    if reference_image_url:
+        result["reference_image_url"] = reference_image_url
+        result["reference_character_profile"] = (
+            "以参考图中的女性为唯一主角：年轻东亚女性，长黑色微卷发，白皙皮肤，鹅蛋脸，大眼睛，精致淡妆，"
+            "白色上衣，珍珠项链。所有配图都必须保持同一人物的脸型、眼睛、发色、气质和辨识度，只改变年龄阶段、服装和场景。"
+        )
+
+    return result
 
 
 def complete_creative_preset(payload: dict[str, Any]) -> dict[str, Any]:
@@ -466,12 +651,12 @@ def _call_text_generation_api(prompt: str, model_priority: list[tuple[str, str]]
         生成的文本内容
     """
     if model_priority is None:
-        # 默认优先级：快速模型优先
+        # 默认优先级：Vertex 优先，Grok 仅作为兜底。
         model_priority = [
+            ("vertex", "gemini-2.5-pro"),
+            ("vertex", "gemini-2.5-flash"),
             ("grok", "grok-4-fast-non-reasoning"),
             ("grok", "grok-4-fast-reasoning"),
-            ("grok", "grok-4-0709"),
-            ("grok", "grok-3"),
         ]
 
     import requests
@@ -639,6 +824,18 @@ def start_generation_job(payload: dict[str, Any]) -> dict[str, Any]:
     return job
 
 
+def status_for_generation_log(message: str) -> str | None:
+    if "Reviewing article draft" in message or "Revising article draft" in message:
+        return "reviewing"
+    if "Generating " in message and " images concurrently" in message:
+        return "generating_images"
+    if message.startswith("Rendering ") or message.startswith("Writing output"):
+        return "rendering"
+    if message.startswith("Uploading output files"):
+        return "uploading"
+    return None
+
+
 def run_generation_job(job_id: str, options: dict[str, Any]) -> None:
     job = load_job(job_id)
     if job is None:
@@ -652,6 +849,10 @@ def run_generation_job(job_id: str, options: dict[str, Any]) -> None:
         original_log_progress(message)
         current = load_job(job_id)
         if current is not None:
+            next_status = status_for_generation_log(message)
+            if next_status is not None:
+                current["status"] = next_status
+                current["updated_at"] = utc_now()
             append_log(current, message)
 
     generator.log_progress = job_log
@@ -827,6 +1028,13 @@ def api_schema() -> dict[str, Any]:
                     "image_style": {"type": "string"},
                     "aspect_ratio": {"type": "string"},
                     "resolution": {"type": "string"},
+                    "outline": {"type": ["string", "null"], "description": "Article outline, e.g. '1. Background 2. Problem 3. Solution 4. Action'"},
+                    "key_points": {"type": ["array", "null"], "items": {"type": "string"}, "description": "List of key points to cover in the article"},
+                    "story_type": {"type": "string", "enum": ["informative", "story", "how-to", "listicle", "analysis"], "description": "Article type (default: 'informative')"},
+                    "needs_reference_image": {"type": "boolean", "description": "Whether this content needs a reference image to maintain visual/character consistency (AI-determined)"},
+                    "reference_image_guidance": {"type": "string", "description": "Guidance on how to use the reference image (in Chinese) if needs_reference_image is true"},
+                    "reference_image_url": {"type": ["string", "null"], "description": "Reference image URL for maintaining visual consistency in narrative-based content"},
+                    "reference_character_profile": {"type": ["string", "null"], "description": "Concrete visual character profile to preserve across generated images"},
                 },
             },
             "ArticleDraft": {
@@ -940,6 +1148,9 @@ class GrokWechatHandler(BaseHTTPRequestHandler):
         if path == "/ui":
             write_text(self, HTTPStatus.OK, NEW_UI_HTML, "text/html; charset=utf-8")
             return
+        if path == "/ui-flow":
+            write_text(self, HTTPStatus.OK, FLOW_UI_HTML, "text/html; charset=utf-8")
+            return
         if path == "/docs":
             write_text(self, HTTPStatus.OK, render_docs_html(self), "text/html; charset=utf-8")
             return
@@ -994,7 +1205,7 @@ class GrokWechatHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
-        if path not in {"/api/articles", "/api/presets/complete", "/api/presets/generate"}:
+        if path not in {"/api/articles", "/api/presets/complete", "/api/presets/generate", "/api/presets/expand-idea"}:
             write_json(self, HTTPStatus.NOT_FOUND, {"error": "Not found"})
             return
         if not require_api_key(self):
@@ -1008,6 +1219,10 @@ class GrokWechatHandler(BaseHTTPRequestHandler):
                 write_json(self, HTTPStatus.ACCEPTED, job)
             elif path == "/api/presets/complete":
                 response_payload = {"preset": complete_creative_preset(payload)}
+                log_api_io(path, payload, HTTPStatus.OK, response_payload)
+                write_json(self, HTTPStatus.OK, response_payload)
+            elif path == "/api/presets/expand-idea":
+                response_payload = expand_idea_to_full_params(payload)
                 log_api_io(path, payload, HTTPStatus.OK, response_payload)
                 write_json(self, HTTPStatus.OK, response_payload)
             else:
@@ -1281,7 +1496,9 @@ INDEX_HTML = r"""<!doctype html>
               <label for="storageMode">存储模式</label>
               <select id="storageMode">
                 <option value="local" selected>local（Studio 内预览推荐）</option>
-                <option value="remote">remote（上传 OSS 并替换资源地址）</option>
+                <option value="remote">remote（优先 R2，缺配置回落 OSS）</option>
+                <option value="r2">r2（上传 Cloudflare R2）</option>
+                <option value="oss">oss（上传阿里云 OSS）</option>
               </select>
             </div>
             <div>
@@ -2126,7 +2343,9 @@ DOCS_HTML = r"""<!doctype html>
               <label for="storageMode">存储模式</label>
               <select id="storageMode">
                 <option value="local">本地预览</option>
-                <option value="remote">上传OSS</option>
+                <option value="remote">自动远程（优先R2）</option>
+                <option value="r2">上传R2</option>
+                <option value="oss">上传OSS</option>
               </select>
             </div>
             <div>
@@ -3247,7 +3466,7 @@ NEW_UI_HTML = r"""<!DOCTYPE html>
           tone: document.getElementById('toneInput').value,
           sections: parseInt(document.getElementById('sectionsInput').value) || undefined,
           image_style: document.getElementById('styleInput').value,
-          storage_mode: 'local'
+          storage_mode: 'remote'
         };
 
         const res = await fetch('/api/articles', {
@@ -3366,6 +3585,736 @@ NEW_UI_HTML = r"""<!DOCTYPE html>
     });
 
     init();
+  </script>
+</body>
+</html>
+"""
+
+
+FLOW_UI_HTML = r"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>✨ AI 文章创意工坊 - 三步生成</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      min-height: 100vh;
+      padding: 40px 20px;
+    }
+
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+
+    header {
+      text-align: center;
+      color: white;
+      margin-bottom: 50px;
+    }
+
+    header h1 {
+      font-size: 36px;
+      margin-bottom: 10px;
+    }
+
+    header p {
+      font-size: 16px;
+      opacity: 0.9;
+    }
+
+    /* 三步进度条 */
+    .steps-progress {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 60px;
+      position: relative;
+    }
+
+    .steps-progress::before {
+      content: '';
+      position: absolute;
+      top: 30px;
+      left: 0;
+      right: 0;
+      height: 2px;
+      background: rgba(255,255,255,0.3);
+      z-index: 0;
+    }
+
+    .step {
+      flex: 1;
+      text-align: center;
+      position: relative;
+      z-index: 1;
+    }
+
+    .step-circle {
+      width: 60px;
+      height: 60px;
+      border-radius: 50%;
+      background: rgba(255,255,255,0.2);
+      border: 3px solid white;
+      margin: 0 auto 15px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 24px;
+      transition: all 0.3s ease;
+    }
+
+    .step.active .step-circle {
+      background: white;
+      color: #667eea;
+      transform: scale(1.1);
+    }
+
+    .step.completed .step-circle {
+      background: #4ade80;
+    }
+
+    .step-label {
+      color: white;
+      font-weight: 600;
+      font-size: 14px;
+    }
+
+    /* 主面板 */
+    .main-panel {
+      background: white;
+      border-radius: 12px;
+      padding: 40px;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+      min-height: 400px;
+    }
+
+    .step-content {
+      display: none;
+    }
+
+    .step-content.active {
+      display: block;
+      animation: fadeIn 0.3s ease;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; }
+      to { opacity: 1; }
+    }
+
+    /* 步骤1: 灵感输入 */
+    .inspire-section h2 {
+      font-size: 24px;
+      margin-bottom: 20px;
+      color: #333;
+    }
+
+    .inspire-section p {
+      color: #666;
+      margin-bottom: 20px;
+      font-size: 14px;
+    }
+
+    textarea {
+      width: 100%;
+      min-height: 150px;
+      padding: 15px;
+      border: 2px solid #e5e7eb;
+      border-radius: 8px;
+      font-size: 14px;
+      font-family: inherit;
+      resize: vertical;
+    }
+
+    textarea:focus {
+      outline: none;
+      border-color: #667eea;
+      box-shadow: 0 0 0 3px rgba(102,126,234,0.1);
+    }
+
+    /* 步骤2: 参数确认 */
+    .confirm-section h2 {
+      font-size: 24px;
+      margin-bottom: 30px;
+      color: #333;
+    }
+
+    .params-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 20px;
+      margin-bottom: 30px;
+    }
+
+    .param-item {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .param-item label {
+      font-weight: 600;
+      color: #333;
+      margin-bottom: 8px;
+      font-size: 13px;
+    }
+
+    .param-item input,
+    .param-item select,
+    .param-item textarea {
+      padding: 10px 12px;
+      border: 1px solid #e5e7eb;
+      border-radius: 6px;
+      font-size: 13px;
+      font-family: inherit;
+    }
+
+    .param-item textarea {
+      min-height: 80px;
+      resize: vertical;
+    }
+
+    .param-item.full-width {
+      grid-column: 1 / -1;
+    }
+
+    .key-points-input {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .key-point-item {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+    }
+
+    .key-point-item input {
+      flex: 1;
+      padding: 8px 10px;
+      border: 1px solid #e5e7eb;
+      border-radius: 4px;
+    }
+
+    .key-point-item button {
+      padding: 6px 12px;
+      background: #ef4444;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+    }
+
+    .add-point-btn {
+      padding: 8px 12px;
+      background: #3b82f6;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+      align-self: flex-start;
+    }
+
+    /* 步骤3: 生成中 */
+    .generating-section h2 {
+      font-size: 24px;
+      margin-bottom: 30px;
+      color: #333;
+    }
+
+    .progress-bar {
+      width: 100%;
+      height: 8px;
+      background: #e5e7eb;
+      border-radius: 4px;
+      overflow: hidden;
+      margin-bottom: 15px;
+    }
+
+    .progress-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #667eea, #764ba2);
+      transition: width 0.3s ease;
+    }
+
+    .progress-text {
+      text-align: center;
+      font-size: 14px;
+      color: #666;
+      margin-bottom: 20px;
+    }
+
+    .logs-container {
+      background: #f9fafb;
+      border-radius: 6px;
+      padding: 15px;
+      max-height: 200px;
+      overflow-y: auto;
+      font-family: 'Courier New', monospace;
+      font-size: 12px;
+      line-height: 1.6;
+      color: #444;
+    }
+
+    .log-line {
+      padding: 4px 0;
+      border-bottom: 1px solid #e5e7eb;
+    }
+
+    .log-line:last-child {
+      border-bottom: none;
+    }
+
+    /* 按钮 */
+    .button-group {
+      display: flex;
+      gap: 10px;
+      justify-content: flex-end;
+      margin-top: 30px;
+    }
+
+    button {
+      padding: 12px 24px;
+      border: none;
+      border-radius: 6px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s ease;
+    }
+
+    button:hover:not(:disabled) {
+      transform: translateY(-2px);
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .btn-primary {
+      background: linear-gradient(135deg, #667eea, #764ba2);
+      color: white;
+    }
+
+    .btn-secondary {
+      background: #e5e7eb;
+      color: #333;
+    }
+
+    .btn-success {
+      background: #4ade80;
+      color: white;
+    }
+
+    .result-link {
+      margin-top: 20px;
+      padding: 15px;
+      background: #ecfdf5;
+      border: 1px solid #4ade80;
+      border-radius: 6px;
+      text-align: center;
+    }
+
+    .result-link a {
+      color: #16a34a;
+      text-decoration: none;
+      font-weight: 600;
+    }
+
+    .result-link a:hover {
+      text-decoration: underline;
+    }
+
+    .error-message {
+      background: #fee2e2;
+      border: 1px solid #ef4444;
+      color: #991b1b;
+      padding: 15px;
+      border-radius: 6px;
+      margin-top: 15px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>✨ AI 文章创意工坊</h1>
+      <p>三步快速生成高质量文章 - 灵感 → 参数 → 成品</p>
+    </header>
+
+    <div class="steps-progress">
+      <div class="step active" data-step="1">
+        <div class="step-circle">💡</div>
+        <div class="step-label">灵感输入</div>
+      </div>
+      <div class="step" data-step="2">
+        <div class="step-circle">⚙️</div>
+        <div class="step-label">参数确认</div>
+      </div>
+      <div class="step" data-step="3">
+        <div class="step-circle">🚀</div>
+        <div class="step-label">生成文章</div>
+      </div>
+    </div>
+
+    <div class="main-panel">
+      <!-- 步骤1: 灵感输入 -->
+      <div class="step-content active inspire-section">
+        <h2>💡 分享你的灵感</h2>
+        <p>描述你想写的文章想法，越详细越好。AI 会自动为你生成完整的文章参数。</p>
+        <textarea id="ideaInput" placeholder="例如：我想写一篇关于如何学习 Python 的文章，特别是针对初学者，想强调边学边做的重要性..."></textarea>
+        <input type="url" id="referenceImageUrl" placeholder="可选：人物/场景参考图 URL，用于保持视觉一致性">
+        <div class="button-group">
+          <button class="btn-primary" onclick="goToStep(2)">💡 生成参数</button>
+        </div>
+      </div>
+
+      <!-- 步骤2: 参数确认 -->
+      <div class="step-content confirm-section">
+        <h2>⚙️ 确认生成参数</h2>
+        <p id="loadingText" style="color: #667eea; font-weight: 600; margin-bottom: 20px; display: none;">🤖 AI 正在生成参数中...</p>
+
+        <div class="params-grid">
+          <div class="param-item">
+            <label>文章主题</label>
+            <input type="text" id="paramTopic" placeholder="文章主题">
+          </div>
+          <div class="param-item">
+            <label>目标受众</label>
+            <input type="text" id="paramAudience" placeholder="目标读者描述">
+          </div>
+          <div class="param-item">
+            <label>文风</label>
+            <input type="text" id="paramTone" placeholder="文章风格">
+          </div>
+          <div class="param-item">
+            <label>章节数</label>
+            <input type="number" id="paramSections" min="2" max="8" value="4">
+          </div>
+          <div class="param-item">
+            <label>文章类型</label>
+            <select id="paramStoryType">
+              <option value="how-to">How-to (如何做...)</option>
+              <option value="story">Story (故事类)</option>
+              <option value="listicle">Listicle (列表式)</option>
+              <option value="analysis">Analysis (分析评论)</option>
+              <option value="informative">Informative (信息类)</option>
+            </select>
+          </div>
+          <div class="param-item">
+            <label>生成质量</label>
+            <select id="paramGenerationProfile">
+              <option value="quality">Quality (深度审稿)</option>
+              <option value="balanced">Balanced (均衡)</option>
+              <option value="speed">Speed (快速)</option>
+            </select>
+          </div>
+          <div class="param-item">
+            <label>宽高比</label>
+            <select id="paramAspectRatio">
+              <option value="16:9">16:9</option>
+              <option value="1:1">1:1</option>
+              <option value="3:4">3:4</option>
+              <option value="9:16">9:16</option>
+            </select>
+          </div>
+          <div class="param-item">
+            <label>分辨率</label>
+            <select id="paramResolution">
+              <option value="2k">2k</option>
+              <option value="1k">1k</option>
+            </select>
+          </div>
+          <div class="param-item">
+            <label>
+              <input type="checkbox" id="paramUseWebSearch">
+              联网检索
+            </label>
+          </div>
+          <div class="param-item full-width">
+            <label>配图风格</label>
+            <input type="text" id="paramImageStyle" placeholder="professional editorial photography, no text overlay">
+          </div>
+          <div class="param-item full-width">
+            <label>参考图 URL</label>
+            <input type="url" id="paramReferenceImageUrl" placeholder="人物/场景参考图 URL">
+          </div>
+          <div class="param-item full-width">
+            <label>文章大纲</label>
+            <textarea id="paramOutline" placeholder="例如: 1. 背景介绍 2. 核心内容 3. 实践案例 4. 总结建议"></textarea>
+          </div>
+          <div class="param-item full-width">
+            <label>核心要点</label>
+            <div class="key-points-input" id="keyPointsContainer">
+              <div class="key-point-item">
+                <input type="text" class="key-point-input" placeholder="要点 1">
+                <button type="button" onclick="removeKeyPoint(this)">删除</button>
+              </div>
+            </div>
+            <button type="button" class="add-point-btn" onclick="addKeyPoint()">+ 添加要点</button>
+          </div>
+        </div>
+
+        <div class="button-group">
+          <button class="btn-secondary" onclick="goToStep(1)">← 返回修改</button>
+          <button class="btn-primary" onclick="goToStep(3)">生成文章 →</button>
+        </div>
+      </div>
+
+      <!-- 步骤3: 生成中 -->
+      <div class="step-content generating-section">
+        <h2>🚀 文章生成中...</h2>
+        <div class="progress-bar">
+          <div class="progress-fill" id="progressFill" style="width: 0%"></div>
+        </div>
+        <div class="progress-text">
+          <span id="progressText">准备中...</span>
+        </div>
+        <div class="logs-container" id="logsContainer"></div>
+        <div id="resultArea"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let state = {
+      currentStep: 1,
+      idea: '',
+      params: {},
+      jobId: null
+    };
+
+    function createKeyPointInput(value = '', placeholder = '新要点') {
+      const div = document.createElement('div');
+      div.className = 'key-point-item';
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.className = 'key-point-input';
+      input.placeholder = placeholder;
+      input.value = value;
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = '删除';
+      button.onclick = function () { removeKeyPoint(button); };
+      div.appendChild(input);
+      div.appendChild(button);
+      return div;
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? '').replace(/[&<>"']/g, (ch) => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;'
+      }[ch]));
+    }
+
+    function goToStep(stepNum) {
+      if (stepNum === 2) {
+        const idea = document.getElementById('ideaInput').value.trim();
+        if (!idea) {
+          alert('请输入你的灵感!');
+          return;
+        }
+        state.idea = idea;
+        state.currentStep = 2;
+        generateParameters();
+      } else if (stepNum === 3) {
+        const params = {
+          ...state.params,
+          topic: document.getElementById('paramTopic').value,
+          audience: document.getElementById('paramAudience').value,
+          tone: document.getElementById('paramTone').value,
+          sections: parseInt(document.getElementById('paramSections').value),
+          outline: document.getElementById('paramOutline').value,
+          story_type: document.getElementById('paramStoryType').value,
+          use_web_search: document.getElementById('paramUseWebSearch').checked,
+          image_style: document.getElementById('paramImageStyle').value,
+          aspect_ratio: document.getElementById('paramAspectRatio').value,
+          resolution: document.getElementById('paramResolution').value,
+          generation_profile: document.getElementById('paramGenerationProfile').value,
+          reference_image_url: document.getElementById('paramReferenceImageUrl').value.trim(),
+          reference_character_profile: state.params.reference_character_profile || '',
+          key_points: Array.from(document.querySelectorAll('.key-point-input'))
+            .map(el => el.value.trim())
+            .filter(v => v),
+          storage_mode: 'remote'
+        };
+
+        if (!params.topic || !params.outline || params.key_points.length === 0) {
+          alert('请填写主题、大纲和至少一个要点!');
+          return;
+        }
+
+        state.params = params;
+        state.currentStep = 3;
+        generateArticle();
+      } else if (stepNum === 1) {
+        state.currentStep = 1;
+      }
+
+      updateUI();
+    }
+
+    function generateParameters() {
+      document.getElementById('loadingText').style.display = 'block';
+      const referenceImageUrl = document.getElementById('referenceImageUrl').value.trim();
+      const payload = { idea: state.idea };
+      if (referenceImageUrl) payload.reference_image_url = referenceImageUrl;
+
+      fetch('/api/presets/expand-idea', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      })
+      .then(r => r.json())
+      .then(data => {
+        if (data.error) {
+          alert('生成失败: ' + data.error);
+          document.getElementById('loadingText').style.display = 'none';
+          return;
+        }
+
+        state.params = {
+          ...data,
+          generation_profile: data.generation_profile || 'quality',
+          reference_image_url: data.reference_image_url || referenceImageUrl || '',
+          reference_character_profile: data.reference_character_profile || ''
+        };
+        document.getElementById('paramTopic').value = data.topic || '';
+        document.getElementById('paramAudience').value = data.audience || '';
+        document.getElementById('paramTone').value = data.tone || '';
+        document.getElementById('paramSections').value = data.sections || 4;
+        document.getElementById('paramOutline').value = data.outline || '';
+        document.getElementById('paramStoryType').value = data.story_type || 'informative';
+        document.getElementById('paramUseWebSearch').checked = Boolean(data.use_web_search);
+        document.getElementById('paramImageStyle').value = data.image_style || 'professional editorial photography, no text overlay';
+        document.getElementById('paramAspectRatio').value = data.aspect_ratio || '16:9';
+        document.getElementById('paramResolution').value = data.resolution || '2k';
+        document.getElementById('paramGenerationProfile').value = state.params.generation_profile;
+        document.getElementById('paramReferenceImageUrl').value = state.params.reference_image_url;
+
+        // 设置 key_points
+        const container = document.getElementById('keyPointsContainer');
+        container.innerHTML = '';
+        (data.key_points || []).forEach((point, idx) => {
+          container.appendChild(createKeyPointInput(point, `要点 ${idx + 1}`));
+        });
+
+        if ((data.key_points || []).length === 0) {
+          container.appendChild(createKeyPointInput('', '要点 1'));
+        }
+
+        document.getElementById('loadingText').style.display = 'none';
+      })
+      .catch(err => {
+        alert('请求失败: ' + err.message);
+        document.getElementById('loadingText').style.display = 'none';
+      });
+    }
+
+    function generateArticle() {
+      fetch('/api/articles', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(state.params)
+      })
+      .then(r => r.json())
+      .then(data => {
+        if (data.error || !data.job_id) {
+          document.getElementById('resultArea').innerHTML =
+            '<div class="error-message">生成失败: ' + escapeHtml(data.error || '接口没有返回 job_id') + '</div>';
+          return;
+        }
+        state.jobId = data.job_id;
+        pollProgress();
+      })
+      .catch(err => {
+        document.getElementById('resultArea').innerHTML = '<div class="error-message">生成失败: ' + escapeHtml(err.message) + '</div>';
+      });
+    }
+
+    function pollProgress() {
+      fetch(`/api/jobs/${state.jobId}`)
+        .then(r => r.json())
+        .then(job => {
+          updateProgress(job);
+
+          if (job.status === 'succeeded') {
+            document.getElementById('resultArea').innerHTML = `
+              <div class="result-link">
+                ✅ 文章生成完成!
+                <br><br>
+                <a href="/outputs/${state.jobId}/article.html" target="_blank">📄 查看完整文章</a>
+              </div>
+            `;
+          } else if (job.status === 'failed') {
+            document.getElementById('resultArea').innerHTML = '<div class="error-message">❌ 生成失败: ' + escapeHtml(job.error || 'Unknown error') + '</div>';
+          } else {
+            setTimeout(pollProgress, 2000);
+          }
+        });
+    }
+
+    function updateProgress(job) {
+      const logs = job.logs || [];
+      const logsHtml = logs.map(l => `<div class="log-line">📌 ${escapeHtml(l.message)}</div>`).join('');
+      document.getElementById('logsContainer').innerHTML = logsHtml;
+
+      const phaseProgress = {
+        queued: 8,
+        running: 25,
+        reviewing: 45,
+        generating_images: 68,
+        rendering: 86,
+        uploading: 92,
+        succeeded: 100
+      };
+      const percent = phaseProgress[job.status] || Math.min(95, 20 + logs.length * 8);
+      document.getElementById('progressFill').style.width = percent + '%';
+      document.getElementById('progressText').textContent = `${job.status || 'running'}... (${logs.length} 步)`;
+    }
+
+    function addKeyPoint() {
+      const container = document.getElementById('keyPointsContainer');
+      container.appendChild(createKeyPointInput());
+    }
+
+    function removeKeyPoint(btn) {
+      btn.parentElement.remove();
+    }
+
+    function updateUI() {
+      document.querySelectorAll('.step').forEach((el, idx) => {
+        el.classList.remove('active', 'completed');
+        if (idx + 1 < state.currentStep) {
+          el.classList.add('completed');
+        } else if (idx + 1 === state.currentStep) {
+          el.classList.add('active');
+        }
+      });
+
+      document.querySelectorAll('.step-content').forEach((el, idx) => {
+        el.classList.remove('active');
+        if (idx + 1 === state.currentStep) {
+          el.classList.add('active');
+        }
+      });
+    }
   </script>
 </body>
 </html>

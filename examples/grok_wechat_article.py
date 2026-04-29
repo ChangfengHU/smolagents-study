@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 """微信公众号文章生成示例。
 
 这个脚本会完成 4 件事：
@@ -15,21 +16,24 @@ from __future__ import annotations
 """
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import hashlib
+import hmac
 import json
 import mimetypes
 import os
 import random
 import re
 import time
-from dataclasses import asdict, dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import requests
+
 
 try:
     from dotenv import load_dotenv
@@ -76,6 +80,11 @@ class ArticleRequest:
     image_style: str = "premium editorial illustration, cinematic lighting, clean composition, no text overlay"
     aspect_ratio: str = "16:9"
     resolution: str = "2k"
+    outline: str | None = None
+    key_points: list[str] | None = field(default=None)
+    story_type: str = "informative"
+    reference_image_url: str | None = None
+    reference_character_profile: str | None = None
 
 
 @dataclass(frozen=True)
@@ -176,7 +185,7 @@ SCRIPT_IMAGE_FALLBACK_CANDIDATES = [
     candidate.strip()
     for candidate in os.getenv(
         "SCRIPT_IMAGE_FALLBACK_CANDIDATES",
-        "grok:grok-imagine-image,vertex:imagen-4.0-generate-001,vertex:imagen-4.0-fast-generate-001,vertex:imagen-4.0-ultra-generate-001",
+        "vertex:imagen-4.0-generate-001,vertex:imagen-4.0-fast-generate-001,vertex:imagen-4.0-ultra-generate-001,grok:grok-imagine-image",
     ).split(",")
     if candidate.strip()
 ]
@@ -193,7 +202,7 @@ SCRIPT_TEXT_GATEWAY_CANDIDATES = [
     candidate.strip()
     for candidate in os.getenv(
         "SCRIPT_TEXT_GATEWAY_CANDIDATES",
-        "grok:grok-4-fast-non-reasoning,vertex:gemini-2.5-flash,grok:grok-3-mini,grok:grok-3,vertex:gemini-2.5-pro",
+        "vertex:gemini-2.5-pro,vertex:gemini-2.5-flash,grok:grok-4-fast-non-reasoning,grok:grok-3-mini,grok:grok-3",
     ).split(",")
     if candidate.strip()
 ]
@@ -202,36 +211,36 @@ SCRIPT_GENERATION_PROFILE = os.getenv("SCRIPT_GENERATION_PROFILE", "balanced").s
 SCRIPT_GENERATION_PROFILES: dict[str, dict[str, list[str]]] = {
     "speed": {
         "text_candidates": [
+            "vertex:gemini-2.5-flash",
             "grok:grok-4-fast-non-reasoning",
             "grok:grok-3-mini",
-            "vertex:gemini-2.5-flash",
         ],
         "image_candidates": [
-            "grok:grok-imagine-image",
             "vertex:imagen-4.0-fast-generate-001",
             "vertex:imagen-4.0-generate-001",
+            "grok:grok-imagine-image",
         ],
     },
     "balanced": {
         "text_candidates": [
-            "grok:grok-4-fast-non-reasoning",
+            "vertex:gemini-2.5-pro",
             "vertex:gemini-2.5-flash",
+            "grok:grok-4-fast-non-reasoning",
             "grok:grok-3-mini",
             "grok:grok-3",
-            "vertex:gemini-2.5-pro",
         ],
         "image_candidates": [
-            "grok:grok-imagine-image",
-            "vertex:imagen-4.0-fast-generate-001",
             "vertex:imagen-4.0-generate-001",
             "vertex:imagen-4.0-ultra-generate-001",
+            "vertex:imagen-4.0-fast-generate-001",
+            "grok:grok-imagine-image",
         ],
     },
     "quality": {
         "text_candidates": [
             "vertex:gemini-2.5-pro",
-            "grok:grok-4-fast-non-reasoning",
             "vertex:gemini-2.5-flash",
+            "grok:grok-4-fast-non-reasoning",
         ],
         "image_candidates": [
             "vertex:imagen-4.0-ultra-generate-001",
@@ -268,6 +277,12 @@ IMAGE_PROMPT_PROFILE_SUFFIX: dict[str, str] = {
         "natural textures, no text overlay, no watermark, no logo, no distorted hands"
     ),
 }
+REFERENCE_IMAGE_CHARACTER_LOCK = (
+    "CHARACTER LOCK: Use the same adult woman as the visual reference. Preserve her visible identity cues: "
+    "young East Asian woman, long black slightly wavy hair, fair skin, oval face, large bright eyes, delicate makeup, "
+    "soft facial features, white blouse, pearl necklace. Keep her recognizable across every image while changing only "
+    "age styling, outfit, pose, lighting, and scene context required by the story. Do not replace her with a generic model."
+)
 # 文本网关专项超时与重试（与 xAI 调用分离），用于缩短拥塞场景耗时。
 SCRIPT_TEXT_GATEWAY_TIMEOUT_SECONDS = int(os.getenv("SCRIPT_TEXT_GATEWAY_TIMEOUT_SECONDS", "45"))
 SCRIPT_TEXT_GATEWAY_RETRY_ATTEMPTS = int(os.getenv("SCRIPT_TEXT_GATEWAY_RETRY_ATTEMPTS", "1"))
@@ -281,7 +296,7 @@ SCRIPT_TEXT_ENABLE_DIRECT_XAI_FALLBACK = os.getenv("SCRIPT_TEXT_ENABLE_DIRECT_XA
 }
 # 统一生图接口的落地模式。local 由 images.vyibc.com 静态资源直接公网访问，通常更快。
 SCRIPT_IMAGE_GATEWAY_STORAGE_BACKEND = os.getenv("SCRIPT_IMAGE_GATEWAY_STORAGE_BACKEND", "local")
-# SCRIPT_STORAGE_MODE: 产物存储模式。local=仅本地输出，remote=上传 OSS 并替换引用。
+# SCRIPT_STORAGE_MODE: 产物存储模式。local=仅本地输出，remote=优先 R2 后回落 OSS，r2=只上传 R2，oss=只上传 OSS。
 SCRIPT_STORAGE_MODE = os.getenv("GROK_WECHAT_STORAGE_MODE", "remote")
 # SCRIPT_OUTPUT_DIR: 输出目录。
 # 留空时，脚本会自动按“主题 + 时间戳”创建新目录。
@@ -365,6 +380,8 @@ class GeneratedImage:
     caption: str
     revised_prompt: str | None = None
     local_path: str | None = None
+    reference_image_url: str | None = None
+    reference_character_profile: str | None = None
 
 
 @dataclass(frozen=True)
@@ -389,6 +406,18 @@ class OSSConfig:
     access_key_secret: str
     bucket_name: str
     endpoint: str = DEFAULT_OSS_ENDPOINT
+    key_prefix: str = "generated_articles"
+    public_base_url: str | None = None
+
+
+@dataclass(frozen=True)
+class R2Config:
+    """Cloudflare R2 S3-compatible upload config."""
+
+    access_key_id: str
+    secret_access_key: str
+    bucket_name: str
+    endpoint_url: str
     key_prefix: str = "generated_articles"
     public_base_url: str | None = None
 
@@ -558,14 +587,17 @@ class XAITextGenerationTool:
             if request.use_web_search
             else "Do not rely on live facts; make the article evergreen and insight-driven."
         )
+        planning_guidance = XAITextGenerationTool._build_planning_guidance(request)
         return (
             f"Create a complete Chinese WeChat article package about: {request.topic}\n"
             f"Audience: {request.audience}\n"
             f"Tone: {request.tone}\n"
             f"Section count: {request.sections}\n"
+            f"Story type: {request.story_type}\n"
             f"Image style guidance: {request.image_style}\n"
             f"Today's date: {today}\n"
             f"Guidance: {search_guidance}\n"
+            f"{planning_guidance}"
             "Requirements:\n"
             "1. The article must be suitable for a polished public-account post.\n"
             "2. Keep the Chinese article natural, specific, and readable on mobile.\n"
@@ -575,8 +607,42 @@ class XAITextGenerationTool:
             "6. Each section needs a hook, two or three concise paragraphs, three to five scannable bullets, and a one-line takeaway.\n"
             "7. The cover image prompt and section image prompts must be in English, visually concrete, and should explicitly avoid text overlays.\n"
             "8. Follow the image style guidance consistently across the cover and section illustrations.\n"
-            "9. Keep the final package self-contained so it can be rendered without extra editing.\n"
+            "9. Follow the outline order and cover every key point explicitly.\n"
+            "10. Keep the final package self-contained so it can be rendered without extra editing.\n"
         )
+
+    @staticmethod
+    def _build_planning_guidance(request: ArticleRequest) -> str:
+        lines: list[str] = []
+        if request.outline:
+            lines.extend(
+                [
+                    "Editorial outline to follow:",
+                    request.outline.strip(),
+                ]
+            )
+        if request.key_points:
+            lines.append("Key points that must be covered:")
+            lines.extend(f"- {point}" for point in request.key_points if str(point).strip())
+        if request.reference_image_url:
+            lines.extend(
+                [
+                    "Reference image URL for visual consistency:",
+                    request.reference_image_url.strip(),
+                    "Use the reference image to keep the main character and visual arc consistent. "
+                    "Image prompts should describe the same person across life stages without claiming identity facts not provided.",
+                ]
+            )
+        if request.reference_character_profile:
+            lines.extend(
+                [
+                    "Reference character profile to preserve in every image prompt:",
+                    request.reference_character_profile.strip(),
+                ]
+            )
+        if not lines:
+            return ""
+        return "\n".join(lines) + "\n"
 
     @staticmethod
     def _build_schema(section_count: int) -> dict[str, Any]:
@@ -692,6 +758,14 @@ class UnifiedTextGenerationTool:
     def generate_article_draft(self, request: ArticleRequest) -> ArticleDraft:
         """并发竞速文本候选，谁先成功返回就用谁。"""
 
+        draft = self._generate_fastest_valid_draft(request)
+        if self.prompt_profile in {"balanced", "quality"}:
+            return self._review_and_revise_draft(request, draft)
+        return draft
+
+    def _generate_fastest_valid_draft(self, request: ArticleRequest) -> ArticleDraft:
+        """并发竞速文本候选，返回最快的结构合法草稿。"""
+
         tasks: list[tuple[str, Any]] = []
         for candidate in self.candidates:
             task_name = f"gateway:{candidate.provider}/{candidate.model}"
@@ -717,6 +791,125 @@ class UnifiedTextGenerationTool:
                     log_progress(f"Text candidate failed: {task_name}: {exc}")
 
         raise XAIAPIError("All text generation backends failed: " + " | ".join(errors[-10:]))
+
+    def _review_and_revise_draft(self, request: ArticleRequest, draft: ArticleDraft) -> ArticleDraft:
+        """用首选文本模型做一次审稿，必要时重写整篇结构化草稿。"""
+
+        if not self.candidates:
+            log_progress("Skipping article review: no gateway candidate configured")
+            return draft
+
+        log_progress("Reviewing article draft")
+        review_candidate = self.candidates[0]
+        try:
+            review = self._request_draft_review(review_candidate, request, draft)
+        except Exception as exc:  # noqa: BLE001
+            log_progress(f"Article review failed, keeping original draft: {exc}")
+            return draft
+
+        score = int(review.get("score", 0) or 0)
+        passes = bool(review.get("passes", False))
+        threshold = 86 if self.prompt_profile == "quality" else 80
+        if passes and score >= threshold:
+            log_progress(f"Article review passed: score={score}")
+            return draft
+
+        log_progress(f"Revising article draft after review: score={score}")
+        try:
+            revised = self._request_draft_revision(review_candidate, request, draft, review)
+            log_progress("Article draft revised successfully")
+            return revised
+        except Exception as exc:  # noqa: BLE001
+            log_progress(f"Article revision failed, keeping original draft: {exc}")
+            return draft
+
+    def _request_draft_review(
+        self,
+        candidate: TextGatewayCandidate,
+        request: ArticleRequest,
+        draft: ArticleDraft,
+    ) -> dict[str, Any]:
+        prompt = self._build_review_prompt(request, draft)
+        raw_text = self._call_gateway_text(candidate, prompt)
+        data = json.loads(_strip_json_fences(raw_text))
+        if not isinstance(data, dict):
+            raise XAIAPIError(f"Review response must be a JSON object: {data}")
+        return data
+
+    def _request_draft_revision(
+        self,
+        candidate: TextGatewayCandidate,
+        request: ArticleRequest,
+        draft: ArticleDraft,
+        review: dict[str, Any],
+    ) -> ArticleDraft:
+        prompt = self._build_revision_prompt(request, draft, review)
+        raw_text = self._call_gateway_text(candidate, prompt)
+        data = json.loads(_strip_json_fences(raw_text))
+        return ArticleDraft.from_dict(data, expected_sections=request.sections)
+
+    def _call_gateway_text(self, candidate: TextGatewayCandidate, prompt: str) -> str:
+        response = requests.post(
+            self.api_url,
+            headers={"Content-Type": "application/json"},
+            json={
+                "provider": candidate.provider,
+                "model": candidate.model,
+                "prompt": prompt,
+            },
+            timeout=self.timeout_seconds,
+        )
+        data = _decode_json(response)
+        if response.status_code >= 400:
+            raise XAIAPIError(_format_http_error(response.status_code, data))
+        raw_text = data.get("text") if isinstance(data, dict) else None
+        if not isinstance(raw_text, str) or not raw_text.strip():
+            raise XAIAPIError(f"Text gateway response missing text: {data}")
+        return raw_text.strip()
+
+    @staticmethod
+    def _build_review_prompt(request: ArticleRequest, draft: ArticleDraft) -> str:
+        return (
+            "你是微信公众号资深主编。请审稿下面的结构化文章草稿，严格检查它是否落实了选题计划。\n\n"
+            "选题计划：\n"
+            f"{XAITextGenerationTool._build_user_prompt(request)}\n"
+            "草稿 JSON：\n"
+            f"{json.dumps(asdict(draft), ensure_ascii=False)}\n\n"
+            "只返回一个 JSON 对象，不要 markdown。格式：\n"
+            "{"
+            "\"passes\": true/false, "
+            "\"score\": 0-100, "
+            "\"issues\": [\"具体问题\"], "
+            "\"revision_instructions\": \"如果需要修改，给出明确改稿指令\""
+            "}\n"
+            "评分重点：是否覆盖所有 key_points、是否遵循 outline、是否符合 audience/tone/story_type、"
+            "是否具体、有行动建议、没有编造统计或来源。"
+        )
+
+    @staticmethod
+    def _build_revision_prompt(
+        request: ArticleRequest,
+        draft: ArticleDraft,
+        review: dict[str, Any],
+    ) -> str:
+        schema = XAITextGenerationTool._build_schema(request.sections)
+        return (
+            "你是微信公众号资深改稿编辑。请根据审稿意见重写下面的文章草稿，输出完整结构化 JSON。\n\n"
+            "选题计划：\n"
+            f"{XAITextGenerationTool._build_user_prompt(request)}\n"
+            "审稿意见：\n"
+            f"{json.dumps(review, ensure_ascii=False)}\n"
+            "原草稿 JSON：\n"
+            f"{json.dumps(asdict(draft), ensure_ascii=False)}\n\n"
+            "改稿要求：\n"
+            "- 必须覆盖所有 key_points，并按 outline 的叙事顺序组织。\n"
+            "- 保留移动端可读性，每节有具体场景、行动建议和收束 takeaway。\n"
+            "- 不要编造统计、日期、机构报告或人物身份事实。\n"
+            "- 图片 prompt 必须是英文，保持人物视觉连续性，不要文字叠加。\n"
+            "- 只返回 JSON 对象，不要 markdown 或解释。\n\n"
+            "JSON Schema：\n"
+            f"{json.dumps(schema, ensure_ascii=False)}"
+        )
 
     def _generate_via_gateway_candidate(self, candidate: TextGatewayCandidate, request: ArticleRequest) -> ArticleDraft:
         prompt = self._build_gateway_prompt(request, self.prompt_profile)
@@ -815,17 +1008,32 @@ class XAIImageGenerationTool:
         aspect_ratio: str,
         resolution: str,
         destination: Path,
+        reference_image_url: str | None = None,
+        reference_character_profile: str | None = None,
     ) -> GeneratedImage:
         """调用生图接口并把图片下载到本地。"""
 
         log_progress(f"Generating image: {destination.name}")
-        tuned_prompt = self._enhance_image_prompt(prompt, aspect_ratio, resolution)
+        tuned_prompt = self._enhance_image_prompt(
+            prompt,
+            aspect_ratio,
+            resolution,
+            reference_image_url,
+            reference_character_profile,
+        )
         source_url: str | None = None
         revised_prompt: str | None = None
         errors: list[str] = []
 
         if self.fallback_candidates:
-            source_url = self._generate_image_url_via_fallback_service(tuned_prompt, aspect_ratio, resolution, errors)
+            source_url = self._generate_image_url_via_fallback_service(
+                tuned_prompt,
+                aspect_ratio,
+                resolution,
+                errors,
+                reference_image_url,
+                reference_character_profile,
+            )
 
         xai_models = (
             [self.client.config.image_model] + [m for m in self.xai_fallback_models if m != self.client.config.image_model]
@@ -860,12 +1068,30 @@ class XAIImageGenerationTool:
             caption=caption,
             revised_prompt=revised_prompt,
             local_path=local_file.name if local_file.parent == destination.parent else str(local_file),
+            reference_image_url=reference_image_url,
+            reference_character_profile=reference_character_profile,
         )
 
-    def _enhance_image_prompt(self, prompt: str, aspect_ratio: str, resolution: str) -> str:
+    def _enhance_image_prompt(
+        self,
+        prompt: str,
+        aspect_ratio: str,
+        resolution: str,
+        reference_image_url: str | None = None,
+        reference_character_profile: str | None = None,
+    ) -> str:
         """把草稿里的图片描述增强为稳定可执行的生图提示词。"""
 
         base_prompt = " ".join(prompt.split())
+        if reference_image_url:
+            character_profile = (reference_character_profile or REFERENCE_IMAGE_CHARACTER_LOCK).strip()
+            base_prompt = (
+                f"{character_profile}\n"
+                f"SCENE TASK: {base_prompt}\n"
+                "REFERENCE REQUIREMENT: The generated image must clearly depict the same woman from the reference portrait. "
+                "Keep facial identity, hair color, overall facial proportions, and recognizable beauty style consistent. "
+                "The scene may change, but the person must not change."
+            )
         suffix = IMAGE_PROMPT_PROFILE_SUFFIX.get(self.prompt_profile, IMAGE_PROMPT_PROFILE_SUFFIX["balanced"])
         if "no text overlay" in base_prompt.lower():
             # 已经有关键约束时，避免重复太多。
@@ -901,6 +1127,8 @@ class XAIImageGenerationTool:
         aspect_ratio: str,
         resolution: str,
         errors: list[str],
+        reference_image_url: str | None = None,
+        reference_character_profile: str | None = None,
     ) -> str | None:
         for candidate in self.fallback_candidates:
             for attempt in range(1, self.client.config.retry_attempts + 1):
@@ -912,6 +1140,13 @@ class XAIImageGenerationTool:
                         "prompt": prompt,
                         "storage_backend": self.gateway_storage_backend,
                     }
+                    if reference_image_url:
+                        payload["reference_image_url"] = reference_image_url
+                        payload["reference_images"] = [reference_image_url]
+                        payload["reference_mode"] = "character"
+                        payload["reference_strength"] = "high"
+                    if reference_character_profile:
+                        payload["reference_character_profile"] = reference_character_profile
                     if candidate.provider == "grok":
                         payload["aspectRatio"] = aspect_ratio
                         payload["resolution"] = resolution
@@ -957,11 +1192,11 @@ class WeChatArticleComposer:
         self,
         text_tool: XAITextGenerationTool,
         image_tool: XAIImageGenerationTool,
-        oss_uploader: "OSSUploader | None" = None,
+        artifact_uploader: "OSSUploader | R2Uploader | None" = None,
     ):
         self.text_tool = text_tool
         self.image_tool = image_tool
-        self.oss_uploader = oss_uploader
+        self.artifact_uploader = artifact_uploader
 
     def compose(self, request: ArticleRequest, output_dir: Path) -> ArticleBundle:
         """生成整套文章包并写入输出目录。"""
@@ -990,6 +1225,8 @@ class WeChatArticleComposer:
                     "aspect_ratio": request.aspect_ratio,
                     "resolution": request.resolution,
                     "destination": images_dir / "cover",
+                    "reference_image_url": request.reference_image_url,
+                    "reference_character_profile": request.reference_character_profile,
                 },
             )
         ]
@@ -1004,6 +1241,8 @@ class WeChatArticleComposer:
                         "aspect_ratio": request.aspect_ratio,
                         "resolution": request.resolution,
                         "destination": images_dir / f"section-{index:02d}",
+                        "reference_image_url": request.reference_image_url,
+                        "reference_character_profile": request.reference_character_profile,
                     },
                 )
             )
@@ -1033,15 +1272,15 @@ class WeChatArticleComposer:
         log_progress("Writing output files")
         public_urls = None
         self._write_bundle_files(output_dir, request, draft, cover_image, section_images, markdown, html)
-        if self.oss_uploader is not None:
-            log_progress("Uploading output files to OSS")
-            public_urls = self.oss_uploader.upload_output_bundle(output_dir)
+        if self.artifact_uploader is not None:
+            log_progress(f"Uploading output files to {self.artifact_uploader.storage_label}")
+            public_urls = self.artifact_uploader.upload_output_bundle(output_dir)
             self._rewrite_rendered_assets_for_public_urls(output_dir, public_urls)
             self._write_public_urls(output_dir, public_urls)
             # article.html / article.md / article.json rewritten after first upload,
-            # so upload once more to keep OSS objects in sync with rewritten links.
-            public_urls = self.oss_uploader.upload_output_bundle(output_dir)
-            log_progress(f"OSS upload done: {public_urls['article_html']}")
+            # so upload once more to keep remote objects in sync with rewritten links.
+            public_urls = self.artifact_uploader.upload_output_bundle(output_dir)
+            log_progress(f"{self.artifact_uploader.storage_label} upload done: {public_urls['article_html']}")
         log_progress("All files written successfully")
 
         return ArticleBundle(
@@ -1133,6 +1372,8 @@ class WeChatArticleComposer:
 class OSSUploader:
     """上传生成产物到阿里云 OSS，并返回可直接访问的链接。"""
 
+    storage_label = "OSS"
+
     def __init__(self, config: OSSConfig):
         try:
             import oss2  # type: ignore
@@ -1204,6 +1445,130 @@ class OSSUploader:
         if suffix in {".html", ".md", ".markdown", ".json", ".txt"}:
             headers["Content-Disposition"] = "inline"
         return headers
+
+
+class R2Uploader:
+    """上传生成产物到 Cloudflare R2，并返回 CDN 或 S3 API 链接。"""
+
+    storage_label = "R2"
+    region = "auto"
+    service = "s3"
+
+    def __init__(self, config: R2Config, session: requests.Session | None = None):
+        self.config = config
+        self.session = session or requests.Session()
+        parsed = urlparse(config.endpoint_url)
+        if not parsed.scheme or not parsed.netloc:
+            raise RuntimeError("R2_ENDPOINT_URL must be a full URL, for example https://<accountid>.r2.cloudflarestorage.com")
+        self.endpoint_scheme = parsed.scheme
+        self.endpoint_host = parsed.netloc
+        self.endpoint_base_path = parsed.path.strip("/")
+
+    def upload_output_bundle(self, output_dir: Path) -> dict[str, str]:
+        """上传文章产物目录，返回关键文件公网链接。"""
+
+        bundle_prefix = "/".join(
+            [
+                self.config.key_prefix.strip("/"),
+                output_dir.name.strip("/"),
+            ]
+        ).strip("/")
+
+        for file_path in sorted(output_dir.rglob("*")):
+            if not file_path.is_file():
+                continue
+            relative = file_path.relative_to(output_dir).as_posix()
+            object_key = f"{bundle_prefix}/{relative}"
+            self._put_file(object_key, file_path)
+            log_progress(f"R2 uploaded: {object_key}")
+
+        return {
+            "article_html": self._public_url(f"{bundle_prefix}/article.html"),
+            "article_markdown": self._public_url(f"{bundle_prefix}/article.md"),
+            "article_json": self._public_url(f"{bundle_prefix}/article.json"),
+            "draft_markdown": self._public_url(f"{bundle_prefix}/draft.md"),
+            "draft_json": self._public_url(f"{bundle_prefix}/draft.json"),
+            "images_base_url": self._public_url(f"{bundle_prefix}/images/"),
+            "output_dir": self._public_url(f"{bundle_prefix}/"),
+        }
+
+    def _put_file(self, object_key: str, file_path: Path) -> None:
+        payload = file_path.read_bytes()
+        url, headers = self._signed_request("PUT", object_key, payload, self._upload_headers(file_path))
+        response = self.session.put(url, data=payload, headers=headers, timeout=120)
+        if response.status_code >= 400:
+            raise RuntimeError(f"R2 upload failed for {object_key}: HTTP {response.status_code} {response.text}")
+
+    def _signed_request(
+        self,
+        method: str,
+        object_key: str,
+        payload: bytes,
+        extra_headers: dict[str, str] | None = None,
+    ) -> tuple[str, dict[str, str]]:
+        now = datetime.now(timezone.utc)
+        amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+        date_stamp = now.strftime("%Y%m%d")
+        payload_hash = hashlib.sha256(payload).hexdigest()
+        path_parts = [part for part in [self.endpoint_base_path, self.config.bucket_name, object_key.lstrip("/")] if part]
+        object_path = "/" + "/".join(quote(part, safe="/") for part in path_parts)
+        url = f"{self.endpoint_scheme}://{self.endpoint_host}{object_path}"
+
+        headers = {
+            "host": self.endpoint_host,
+            "x-amz-content-sha256": payload_hash,
+            "x-amz-date": amz_date,
+        }
+        if extra_headers:
+            headers.update({key.lower(): value for key, value in extra_headers.items()})
+
+        signed_header_names = sorted(headers)
+        canonical_headers = "".join(f"{name}:{headers[name]}\n" for name in signed_header_names)
+        signed_header_string = ";".join(signed_header_names)
+        canonical_request = "\n".join(
+            [
+                method,
+                object_path,
+                "",
+                canonical_headers,
+                signed_header_string,
+                payload_hash,
+            ]
+        )
+        credential_scope = f"{date_stamp}/{self.region}/{self.service}/aws4_request"
+        string_to_sign = "\n".join(
+            [
+                "AWS4-HMAC-SHA256",
+                amz_date,
+                credential_scope,
+                hashlib.sha256(canonical_request.encode()).hexdigest(),
+            ]
+        )
+        signature = hmac.new(self._signing_key(date_stamp), string_to_sign.encode(), hashlib.sha256).hexdigest()
+        headers["authorization"] = (
+            "AWS4-HMAC-SHA256 "
+            f"Credential={self.config.access_key_id}/{credential_scope}, "
+            f"SignedHeaders={signed_header_string}, "
+            f"Signature={signature}"
+        )
+        return url, headers
+
+    def _signing_key(self, date_stamp: str) -> bytes:
+        key_date = hmac.new(f"AWS4{self.config.secret_access_key}".encode(), date_stamp.encode(), hashlib.sha256).digest()
+        key_region = hmac.new(key_date, self.region.encode(), hashlib.sha256).digest()
+        key_service = hmac.new(key_region, self.service.encode(), hashlib.sha256).digest()
+        return hmac.new(key_service, b"aws4_request", hashlib.sha256).digest()
+
+    def _public_url(self, object_key: str) -> str:
+        if self.config.public_base_url:
+            return f"{self.config.public_base_url.rstrip('/')}/{object_key.lstrip('/')}"
+        path_parts = [part for part in [self.endpoint_base_path, self.config.bucket_name, object_key.lstrip("/")] if part]
+        object_path = "/".join(quote(part, safe="/") for part in path_parts)
+        return f"{self.endpoint_scheme}://{self.endpoint_host}/{object_path}"
+
+    @staticmethod
+    def _upload_headers(file_path: Path) -> dict[str, str]:
+        return OSSUploader._upload_headers(file_path)
 
 
 def extract_response_output_text(response_payload: dict[str, Any]) -> str:
@@ -1622,8 +1987,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--storage-mode",
         default=SCRIPT_STORAGE_MODE,
-        choices=["local", "remote"],
-        help="Artifact storage mode: local (no OSS) or remote (upload to OSS and rewrite links).",
+        choices=["local", "remote", "r2", "oss"],
+        help="Artifact storage mode: local, remote (prefer R2 then OSS), r2, or oss.",
     )
     parser.add_argument(
         "--api-key",
@@ -1654,6 +2019,11 @@ def generate_wechat_article(
     resolution: str | None = None,
     storage_mode: str | None = None,
     generation_profile: str | None = None,
+    outline: str | None = None,
+    key_points: list[str] | None = None,
+    story_type: str | None = None,
+    reference_image_url: str | None = None,
+    reference_character_profile: str | None = None,
 ) -> ArticleBundle:
     """Generate a complete WeChat article bundle.
 
@@ -1675,6 +2045,11 @@ def generate_wechat_article(
         image_style=image_style if image_style is not None else request.image_style,
         aspect_ratio=aspect_ratio if aspect_ratio is not None else request.aspect_ratio,
         resolution=resolution if resolution is not None else request.resolution,
+        outline=outline,
+        key_points=key_points,
+        story_type=story_type if story_type is not None else "informative",
+        reference_image_url=reference_image_url,
+        reference_character_profile=reference_character_profile,
     )
     api_key = SCRIPT_API_KEY or resolve_api_key()
     base_url = os.getenv("XAI_BASE_URL", SCRIPT_BASE_URL)
@@ -1700,8 +2075,8 @@ def generate_wechat_article(
         raise SystemExit("Missing topic in selected preset. Update the preset json file.")
     if request.sections < 1:
         raise SystemExit("Preset section_count must be at least 1.")
-    if selected_storage_mode not in {"local", "remote"}:
-        raise SystemExit("storage_mode must be either 'local' or 'remote'.")
+    if selected_storage_mode not in {"local", "remote", "r2", "oss"}:
+        raise SystemExit("storage_mode must be one of: local, remote, r2, oss.")
     if selected_generation_profile not in SCRIPT_GENERATION_PROFILES:
         supported_profiles = ", ".join(sorted(SCRIPT_GENERATION_PROFILES))
         raise SystemExit(f"generation_profile must be one of: {supported_profiles}.")
@@ -1726,21 +2101,25 @@ def generate_wechat_article(
         log_progress("xAI API key missing: direct xAI fallback is disabled, unified gateway remains enabled")
     elif not SCRIPT_TEXT_ENABLE_DIRECT_XAI_FALLBACK:
         log_progress("Direct xAI text fallback disabled: use unified text gateway candidates only")
-    oss_uploader = None
-    if selected_storage_mode == "remote":
-        oss_config = resolve_oss_config()
-        if oss_config is None:
+    artifact_uploader = None
+    if selected_storage_mode != "local":
+        artifact_uploader = resolve_artifact_uploader(selected_storage_mode)
+        if artifact_uploader is None:
             raise SystemExit(
-                "storage_mode=remote requires OSS config. Set OSS_ACCESS_KEY_ID / OSS_ACCESS_KEY_SECRET / OSS_BUCKET_NAME."
+                f"storage_mode={selected_storage_mode} requires R2 or OSS config. "
+                "For R2 set R2_ENDPOINT_URL / R2_BUCKET_NAME / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY. "
+                "For OSS set OSS_ACCESS_KEY_ID / OSS_ACCESS_KEY_SECRET / OSS_BUCKET_NAME."
             )
-        oss_uploader = OSSUploader(oss_config)
-        log_progress(f"Storage mode: remote (OSS bucket={oss_config.bucket_name}, endpoint={oss_config.endpoint})")
+        log_progress(f"Storage mode: {selected_storage_mode} ({artifact_uploader.storage_label})")
     else:
-        log_progress("Storage mode: local (skip OSS upload and URL rewrite)")
+        log_progress("Storage mode: local (skip remote upload and URL rewrite)")
     profile = SCRIPT_GENERATION_PROFILES[selected_generation_profile]
     selected_prompt_profile = SCRIPT_PROMPT_PROFILE or selected_generation_profile
     text_candidates = resolve_text_gateway_candidates(profile["text_candidates"])
     image_candidates = resolve_image_fallback_candidates(profile["image_candidates"])
+    if request.reference_image_url:
+        image_candidates = sorted(image_candidates, key=lambda item: 0 if item.provider == "grok" else 1)
+        log_progress("Reference image provided: prioritizing image candidates that can better follow character prompts")
     log_progress(
         f"Generation profile: {selected_generation_profile} "
         f"(text={','.join(f'{item.provider}:{item.model}' for item in text_candidates)}; "
@@ -1765,7 +2144,7 @@ def generate_wechat_article(
             gateway_storage_backend=SCRIPT_IMAGE_GATEWAY_STORAGE_BACKEND,
             prompt_profile=selected_prompt_profile,
         ),
-        oss_uploader=oss_uploader,
+        artifact_uploader=artifact_uploader,
     )
     # 这里开始真正生成文章、图片和输出文件。
     return composer.compose(request, output_dir=target_output_dir)
@@ -1844,6 +2223,45 @@ def resolve_oss_config() -> OSSConfig | None:
         key_prefix=key_prefix,
         public_base_url=public_base_url,
     )
+
+
+def resolve_r2_config() -> R2Config | None:
+    """从环境变量解析 Cloudflare R2 配置，缺项时返回 None。"""
+
+    access_key_id = os.getenv("R2_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID")
+    secret_access_key = os.getenv("R2_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY")
+    bucket_name = os.getenv("R2_BUCKET_NAME")
+    endpoint_url = os.getenv("R2_ENDPOINT_URL")
+    key_prefix = os.getenv("R2_KEY_PREFIX", "generated_articles")
+    public_base_url = os.getenv("R2_PUBLIC_BASE_URL")
+    if not access_key_id or not secret_access_key or not bucket_name or not endpoint_url:
+        return None
+    return R2Config(
+        access_key_id=access_key_id,
+        secret_access_key=secret_access_key,
+        bucket_name=bucket_name,
+        endpoint_url=endpoint_url.rstrip("/"),
+        key_prefix=key_prefix,
+        public_base_url=public_base_url,
+    )
+
+
+def resolve_artifact_uploader(storage_mode: str) -> OSSUploader | R2Uploader | None:
+    """根据存储模式选择上传器。remote 会优先 R2，缺配置时回落 OSS。"""
+
+    mode = storage_mode.strip().lower()
+    if mode in {"remote", "r2"}:
+        r2_config = resolve_r2_config()
+        if r2_config is not None:
+            return R2Uploader(r2_config)
+        if mode == "r2":
+            return None
+
+    if mode in {"remote", "oss"}:
+        oss_config = resolve_oss_config()
+        if oss_config is not None:
+            return OSSUploader(oss_config)
+    return None
 
 
 def resolve_image_fallback_candidates(raw_candidates: list[str] | None = None) -> list[ImageFallbackCandidate]:
